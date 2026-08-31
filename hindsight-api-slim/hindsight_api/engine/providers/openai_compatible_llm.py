@@ -36,7 +36,7 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, LengthFinish
 
 from hindsight_api.config import get_config
 from hindsight_api.engine.aiohttp_session import LoopLocalSession, UpstreamHTTPError, raise_for_status
-from hindsight_api.engine.bank_attribution import apply_bank_attribution
+from hindsight_api.engine.bank_attribution import apply_bank_attribution, reranker_bank_attribution_headers
 from hindsight_api.engine.cache_affinity import (
     CacheAffinityMode,
     apply_cache_affinity,
@@ -1391,6 +1391,8 @@ class OpenAICompatibleLLM(LLMInterface):
             body["provider"] = {"require_parameters": True, **body.get("provider", {})}
 
         apply_bank_attribution(call_params)
+        if scope == "rerank":
+            call_params["extra_headers"] = reranker_bank_attribution_headers()
         # Cache pinning, alongside the other identity injection above and, like
         # call_params itself, built ONCE before the retry loop so every attempt
         # carries it. Note the hash-point: when no trace context is bound the id
