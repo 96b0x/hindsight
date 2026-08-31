@@ -1019,8 +1019,8 @@ ZeroEntropy's `zembed-1` supports Matryoshka dimensions: `2560`, `1280`, `640`, 
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `openrouter`, `zeroentropy`, `siliconflow`, `alibaba`, `google`, `flashrank`, `litellm`, `litellm-sdk`, `jina-mlx`, or `rrf` | `local` |
-| `HINDSIGHT_API_RERANKER_SEND_BANK_AS_HEADER` | Add `X-Hindsight-Bank-Id: <bank_id>` to remote reranker requests. Enable only for trusted endpoints because this transmits the current bank ID. Covers TEI, Cohere-compatible HTTP, LiteLLM proxy, and LiteLLM SDK transports. | `false` |
+| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `openrouter`, `zeroentropy`, `siliconflow`, `alibaba`, `google`, `flashrank`, `litellm`, `litellm-sdk`, `llm-multicriteria`, `jina-mlx`, or `rrf` | `local` |
+| `HINDSIGHT_API_RERANKER_SEND_BANK_AS_HEADER` | Add `X-Hindsight-Bank-Id: <bank_id>` to remote reranker requests. Enable only for trusted endpoints because this transmits the current bank ID. Covers TEI, Cohere-compatible HTTP, LiteLLM proxy/SDK, and LLM multi-criteria transports. | `false` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MODEL` | Model for local provider | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT` | Max concurrent local reranking (prevents CPU thrashing under load) | `4` |
 | `HINDSIGHT_API_RERANKER_LOCAL_TRUST_REMOTE_CODE` | Allow loading models with custom code (security risk, disabled by default) | `false` |
@@ -1037,6 +1037,12 @@ ZeroEntropy's `zembed-1` supports Matryoshka dimensions: `2560`, `1280`, `640`, 
 | `HINDSIGHT_API_RERANKER_OPENROUTER_MODEL` | OpenRouter rerank model | `cohere/rerank-v3.5` |
 | `HINDSIGHT_API_RERANKER_OPENROUTER_TIMEOUT` | HTTP request timeout for OpenRouter reranker (seconds). | `60.0` |
 | `HINDSIGHT_API_RERANKER_OPENROUTER_BASE_URL` | Rerank endpoint URL (point at a Cohere-compatible gateway/proxy for metering) | `https://openrouter.ai/api/v1/rerank` |
+| `HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_API_KEY` | API key for listwise LLM reranking (falls back to `HINDSIGHT_API_OPENROUTER_API_KEY`, then `HINDSIGHT_API_LLM_API_KEY`) | - |
+| `HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_MODEL` | OpenAI-compatible chat model used to select and order opaque candidate IDs | `google/gemini-3.5-flash-lite` |
+| `HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_BASE_URL` | OpenAI-compatible chat-completions base URL | `https://openrouter.ai/api/v1` |
+| `HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_TOP_N` | Maximum candidate IDs requested from the LLM; unselected candidates retain fusion order behind them | `32` |
+| `HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_TIMEOUT` | LLM request timeout in seconds; failures fall back to fusion order | `30.0` |
+| `HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_MAX_CONCURRENT` | Maximum concurrent LLM reranking calls | `4` |
 | `HINDSIGHT_API_RERANKER_COHERE_API_KEY` | Cohere API key for reranking (falls back to `HINDSIGHT_API_COHERE_API_KEY`) | - |
 | `HINDSIGHT_API_RERANKER_COHERE_MODEL` | Cohere rerank model | `rerank-english-v3.0` |
 | `HINDSIGHT_API_RERANKER_COHERE_BASE_URL` | Custom base URL for any Cohere-compatible `/rerank` endpoint (Azure AI Foundry, Jina, Voyage, self-hosted BGE, etc.). When set, the `cohere` provider bypasses the Cohere SDK and calls the endpoint directly via HTTP. | - |
@@ -1162,6 +1168,15 @@ export HINDSIGHT_API_RERANKER_TEI_URL=http://localhost:8081
 export HINDSIGHT_API_RERANKER_PROVIDER=openrouter
 export HINDSIGHT_API_RERANKER_OPENROUTER_API_KEY=your-openrouter-api-key  # or reuses HINDSIGHT_API_LLM_API_KEY
 export HINDSIGHT_API_RERANKER_OPENROUTER_MODEL=cohere/rerank-v3.5
+
+# LLM multi-criteria - one listwise structured-output call over the fused pool.
+# Candidate text is untrusted data; the model returns opaque IDs only. Invalid
+# IDs are discarded, prompt-injection candidates can be explicitly demoted, and
+# provider/schema/timeout failures preserve the incoming fusion order.
+export HINDSIGHT_API_RERANKER_PROVIDER=llm-multicriteria
+export HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_API_KEY=your-openrouter-api-key
+export HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_MODEL=google/gemini-3.5-flash-lite
+export HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_TOP_N=32
 
 # Cohere - cloud-based reranking
 export HINDSIGHT_API_RERANKER_PROVIDER=cohere

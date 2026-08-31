@@ -432,6 +432,14 @@ ENV_RERANKER_OPENROUTER_API_KEY = "HINDSIGHT_API_RERANKER_OPENROUTER_API_KEY"
 ENV_RERANKER_OPENROUTER_MODEL = "HINDSIGHT_API_RERANKER_OPENROUTER_MODEL"
 ENV_RERANKER_OPENROUTER_BASE_URL = "HINDSIGHT_API_RERANKER_OPENROUTER_BASE_URL"
 
+# LLM multi-criteria reranker (OpenAI-compatible chat-completions API)
+ENV_RERANKER_LLM_MULTICRITERIA_API_KEY = "HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_API_KEY"
+ENV_RERANKER_LLM_MULTICRITERIA_MODEL = "HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_MODEL"
+ENV_RERANKER_LLM_MULTICRITERIA_BASE_URL = "HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_BASE_URL"
+ENV_RERANKER_LLM_MULTICRITERIA_TOP_N = "HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_TOP_N"
+ENV_RERANKER_LLM_MULTICRITERIA_TIMEOUT = "HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_TIMEOUT"
+ENV_RERANKER_LLM_MULTICRITERIA_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_LLM_MULTICRITERIA_MAX_CONCURRENT"
+
 # Requesty configuration (OpenAI-compatible gateway; embeddings)
 ENV_REQUESTY_API_KEY = "HINDSIGHT_API_REQUESTY_API_KEY"
 ENV_EMBEDDINGS_REQUESTY_API_KEY = "HINDSIGHT_API_EMBEDDINGS_REQUESTY_API_KEY"
@@ -1132,6 +1140,11 @@ DEFAULT_RERANKER_COHERE_MODEL = "rerank-english-v3.0"
 DEFAULT_EMBEDDINGS_OPENROUTER_MODEL = "perplexity/pplx-embed-v1-0.6b"
 DEFAULT_RERANKER_OPENROUTER_MODEL = "cohere/rerank-v3.5"
 DEFAULT_RERANKER_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/rerank"
+DEFAULT_RERANKER_LLM_MULTICRITERIA_MODEL = "google/gemini-3.5-flash-lite"
+DEFAULT_RERANKER_LLM_MULTICRITERIA_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_RERANKER_LLM_MULTICRITERIA_TOP_N = 32
+DEFAULT_RERANKER_LLM_MULTICRITERIA_TIMEOUT = 30.0
+DEFAULT_RERANKER_LLM_MULTICRITERIA_MAX_CONCURRENT = 4
 
 # Requesty defaults
 DEFAULT_EMBEDDINGS_REQUESTY_MODEL = "openai/text-embedding-3-small"
@@ -2064,6 +2077,13 @@ class RerankerMemberConfig:
     openrouter_model: str
     openrouter_base_url: str
     openrouter_timeout: float
+    # llm-multicriteria
+    llm_multicriteria_api_key: str | None
+    llm_multicriteria_model: str
+    llm_multicriteria_base_url: str
+    llm_multicriteria_top_n: int
+    llm_multicriteria_timeout: float
+    llm_multicriteria_max_concurrent: int
     # flashrank
     flashrank_model: str
     flashrank_cache_dir: str | None
@@ -2200,6 +2220,22 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 openrouter_model=_member_str(base, "OPENROUTER_MODEL", DEFAULT_RERANKER_OPENROUTER_MODEL),
                 openrouter_base_url=_member_str(base, "OPENROUTER_BASE_URL", DEFAULT_RERANKER_OPENROUTER_BASE_URL),
                 openrouter_timeout=_member_float(base, "OPENROUTER_TIMEOUT", DEFAULT_RERANKER_OPENROUTER_TIMEOUT),
+                llm_multicriteria_api_key=_member_opt_str(base, "LLM_MULTICRITERIA_API_KEY"),
+                llm_multicriteria_model=_member_str(
+                    base, "LLM_MULTICRITERIA_MODEL", DEFAULT_RERANKER_LLM_MULTICRITERIA_MODEL
+                ),
+                llm_multicriteria_base_url=_member_str(
+                    base, "LLM_MULTICRITERIA_BASE_URL", DEFAULT_RERANKER_LLM_MULTICRITERIA_BASE_URL
+                ),
+                llm_multicriteria_top_n=_member_int(
+                    base, "LLM_MULTICRITERIA_TOP_N", DEFAULT_RERANKER_LLM_MULTICRITERIA_TOP_N
+                ),
+                llm_multicriteria_timeout=_member_float(
+                    base, "LLM_MULTICRITERIA_TIMEOUT", DEFAULT_RERANKER_LLM_MULTICRITERIA_TIMEOUT
+                ),
+                llm_multicriteria_max_concurrent=_member_int(
+                    base, "LLM_MULTICRITERIA_MAX_CONCURRENT", DEFAULT_RERANKER_LLM_MULTICRITERIA_MAX_CONCURRENT
+                ),
                 flashrank_model=_member_str(base, "FLASHRANK_MODEL", DEFAULT_RERANKER_FLASHRANK_MODEL),
                 flashrank_cache_dir=_member_opt_str(base, "FLASHRANK_CACHE_DIR"),
                 flashrank_cpu_mem_arena=_member_bool(
@@ -2520,6 +2556,12 @@ class HindsightConfig:
     reranker_openrouter_model: str
     reranker_openrouter_base_url: str
     reranker_openrouter_timeout: float
+    reranker_llm_multicriteria_api_key: str | None
+    reranker_llm_multicriteria_model: str
+    reranker_llm_multicriteria_base_url: str
+    reranker_llm_multicriteria_top_n: int
+    reranker_llm_multicriteria_timeout: float
+    reranker_llm_multicriteria_max_concurrent: int
     reranker_litellm_api_base: str
     reranker_litellm_api_key: str | None
     reranker_litellm_model: str
@@ -2862,6 +2904,7 @@ class HindsightConfig:
         "retain_llm_api_key",
         "reflect_llm_api_key",
         "consolidation_llm_api_key",
+        "reranker_llm_multicriteria_api_key",
         # LiteLLM Router chains — entries embed api_keys and base_urls
         "llm_litellmrouter_config",
         "retain_llm_litellmrouter_config",
@@ -2883,6 +2926,7 @@ class HindsightConfig:
         "reranker_tei_base_url",
         "reranker_cohere_base_url",
         "reranker_openrouter_base_url",
+        "reranker_llm_multicriteria_base_url",
         "embeddings_zeroentropy_base_url",
         "reranker_zeroentropy_base_url",
         "reranker_siliconflow_base_url",
@@ -3012,6 +3056,12 @@ class HindsightConfig:
             openrouter_model=self.reranker_openrouter_model,
             openrouter_base_url=self.reranker_openrouter_base_url,
             openrouter_timeout=self.reranker_openrouter_timeout,
+            llm_multicriteria_api_key=self.reranker_llm_multicriteria_api_key,
+            llm_multicriteria_model=self.reranker_llm_multicriteria_model,
+            llm_multicriteria_base_url=self.reranker_llm_multicriteria_base_url,
+            llm_multicriteria_top_n=self.reranker_llm_multicriteria_top_n,
+            llm_multicriteria_timeout=self.reranker_llm_multicriteria_timeout,
+            llm_multicriteria_max_concurrent=self.reranker_llm_multicriteria_max_concurrent,
             # flashrank has no HindsightConfig fields — it is read from the env directly
             flashrank_model=os.environ.get(ENV_RERANKER_FLASHRANK_MODEL, DEFAULT_RERANKER_FLASHRANK_MODEL),
             flashrank_cache_dir=os.environ.get(ENV_RERANKER_FLASHRANK_CACHE_DIR, DEFAULT_RERANKER_FLASHRANK_CACHE_DIR),
@@ -3728,6 +3778,28 @@ class HindsightConfig:
             ),
             reranker_openrouter_timeout=float(
                 os.getenv(ENV_RERANKER_OPENROUTER_TIMEOUT, str(DEFAULT_RERANKER_OPENROUTER_TIMEOUT))
+            ),
+            # LLM multi-criteria reranker (chat-completions, not OpenRouter's /rerank endpoint)
+            reranker_llm_multicriteria_api_key=os.getenv(ENV_RERANKER_LLM_MULTICRITERIA_API_KEY)
+            or os.getenv(ENV_OPENROUTER_API_KEY)
+            or os.getenv(ENV_LLM_API_KEY),
+            reranker_llm_multicriteria_model=os.getenv(
+                ENV_RERANKER_LLM_MULTICRITERIA_MODEL, DEFAULT_RERANKER_LLM_MULTICRITERIA_MODEL
+            ),
+            reranker_llm_multicriteria_base_url=os.getenv(
+                ENV_RERANKER_LLM_MULTICRITERIA_BASE_URL, DEFAULT_RERANKER_LLM_MULTICRITERIA_BASE_URL
+            ),
+            reranker_llm_multicriteria_top_n=int(
+                os.getenv(ENV_RERANKER_LLM_MULTICRITERIA_TOP_N, str(DEFAULT_RERANKER_LLM_MULTICRITERIA_TOP_N))
+            ),
+            reranker_llm_multicriteria_timeout=float(
+                os.getenv(ENV_RERANKER_LLM_MULTICRITERIA_TIMEOUT, str(DEFAULT_RERANKER_LLM_MULTICRITERIA_TIMEOUT))
+            ),
+            reranker_llm_multicriteria_max_concurrent=int(
+                os.getenv(
+                    ENV_RERANKER_LLM_MULTICRITERIA_MAX_CONCURRENT,
+                    str(DEFAULT_RERANKER_LLM_MULTICRITERIA_MAX_CONCURRENT),
+                )
             ),
             # LiteLLM reranker (with backward-compatible fallback to shared config)
             reranker_litellm_api_base=os.getenv(ENV_RERANKER_LITELLM_API_BASE)
