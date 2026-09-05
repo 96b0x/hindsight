@@ -275,20 +275,6 @@ enum BankCommands {
         mission: String,
     },
 
-    /// Set or merge bank background (deprecated: use mission instead)
-    #[command(hide = true)]
-    Background {
-        /// Bank ID
-        bank_id: String,
-
-        /// Background content
-        content: String,
-
-        /// Skip automatic disposition inference
-        #[arg(long)]
-        no_update_disposition: bool,
-    },
-
     /// Get memory graph data
     Graph {
         /// Bank ID
@@ -415,7 +401,7 @@ enum BankCommands {
         yes: bool,
     },
 
-    /// Set disposition traits directly (1-5 each, via PUT /profile)
+    /// Set disposition traits directly (1-5 each, stored as bank config)
     SetDisposition {
         /// Bank ID
         bank_id: String,
@@ -1052,6 +1038,11 @@ enum MentalModelCommands {
         /// Refresh this mental model automatically after observations consolidation
         #[arg(long)]
         trigger_refresh_after_consolidation: bool,
+
+        /// Refresh mode: full (default) regenerates the content from scratch on
+        /// each refresh, delta edits the existing content in place
+        #[arg(long)]
+        trigger_mode: Option<String>,
     },
 
     /// Update a mental model
@@ -1081,6 +1072,35 @@ enum MentalModelCommands {
         /// Enable/disable automatic refresh after observations consolidation
         #[arg(long)]
         trigger_refresh_after_consolidation: Option<bool>,
+
+        /// Refresh mode: full or delta. Trigger settings you do not pass keep
+        /// their stored values.
+        #[arg(long)]
+        trigger_mode: Option<String>,
+
+        /// Cron expression (UTC, 5-field, e.g. '0 3 * * *') for scheduled
+        /// refreshes. Setting one turns off refresh-after-consolidation, which
+        /// it is mutually exclusive with. Empty string removes the schedule
+        #[arg(long)]
+        trigger_refresh_cron: Option<String>,
+
+        /// Minimum seconds between two automatic refreshes (0 disables the floor)
+        #[arg(long)]
+        trigger_min_refresh_interval_seconds: Option<u64>,
+
+        /// How the model's tags filter memories during refresh: any, all,
+        /// any_strict, all_strict, exact. Pass an empty string to fall back to
+        /// the server default
+        #[arg(long)]
+        trigger_tags_match: Option<String>,
+
+        /// Record how each refresh reached its result under reflect_response.trace
+        #[arg(long)]
+        trigger_keep_trace: Option<bool>,
+
+        /// Exclude all mental models from the reflect loop during refresh
+        #[arg(long)]
+        trigger_exclude_mental_models: Option<bool>,
     },
 
     /// Delete a mental model
@@ -1435,18 +1455,6 @@ fn run() -> Result<()> {
             BankCommands::Mission { bank_id, mission } => {
                 commands::bank::mission(&client, &bank_id, &mission, verbose, output_format)
             }
-            BankCommands::Background {
-                bank_id,
-                content,
-                no_update_disposition,
-            } => commands::bank::update_background(
-                &client,
-                &bank_id,
-                &content,
-                no_update_disposition,
-                verbose,
-                output_format,
-            ),
             BankCommands::Graph {
                 bank_id,
                 fact_type,
@@ -1842,6 +1850,7 @@ fn run() -> Result<()> {
                 max_tokens,
                 tags_match,
                 trigger_refresh_after_consolidation,
+                trigger_mode,
             } => commands::mental_model::create(
                 &client,
                 &bank_id,
@@ -1852,6 +1861,7 @@ fn run() -> Result<()> {
                 max_tokens,
                 tags_match.as_deref(),
                 trigger_refresh_after_consolidation,
+                trigger_mode.as_deref(),
                 verbose,
                 output_format,
             ),
@@ -1863,6 +1873,12 @@ fn run() -> Result<()> {
                 max_tokens,
                 tags,
                 trigger_refresh_after_consolidation,
+                trigger_mode,
+                trigger_refresh_cron,
+                trigger_min_refresh_interval_seconds,
+                trigger_tags_match,
+                trigger_keep_trace,
+                trigger_exclude_mental_models,
             } => commands::mental_model::update(
                 &client,
                 &bank_id,
@@ -1871,7 +1887,15 @@ fn run() -> Result<()> {
                 source_query,
                 max_tokens,
                 tags,
-                trigger_refresh_after_consolidation,
+                &commands::mental_model::TriggerUpdate {
+                    mode: trigger_mode,
+                    refresh_after_consolidation: trigger_refresh_after_consolidation,
+                    refresh_cron: trigger_refresh_cron,
+                    min_refresh_interval_seconds: trigger_min_refresh_interval_seconds,
+                    tags_match: trigger_tags_match,
+                    keep_trace: trigger_keep_trace,
+                    exclude_mental_models: trigger_exclude_mental_models,
+                },
                 verbose,
                 output_format,
             ),

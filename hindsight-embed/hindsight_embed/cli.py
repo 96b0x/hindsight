@@ -17,7 +17,6 @@ Environment variables:
     HINDSIGHT_EMBED_API_URL: Optional. Use external API server instead of starting local daemon.
     HINDSIGHT_EMBED_API_TOKEN: Optional. Authentication token for external API (sent as Bearer token).
     HINDSIGHT_EMBED_API_DATABASE_URL: Optional. Database URL for daemon (default: "pg0://hindsight-embed").
-    HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT: Optional. Seconds before daemon auto-exits when idle (default: 300).
     HINDSIGHT_EMBED_API_VERSION: Optional. hindsight-api version to use (default: matches embed version).
                                  Note: Only applies when starting daemon. To change version, stop daemon first.
     HINDSIGHT_EMBED_CLI_VERSION: Optional. hindsight CLI version to install (default: {embed_version}).
@@ -104,7 +103,7 @@ def load_config_file():
 
     # Load ONLY this profile's config, never fall back to default
     if config_path.exists():
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -116,26 +115,36 @@ def load_config_file():
                         os.environ[key] = value
 
 
-def get_config():
-    """Get configuration from environment variables.
+ENV_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
+ENV_LLM_API_KEY = "HINDSIGHT_API_LLM_API_KEY"
 
-    `llm_model` is left unset (None) when the env var is missing — the daemon's
-    hindsight-api process owns `PROVIDER_DEFAULT_MODELS` and resolves the
-    provider-keyed default itself. Duplicating that table here would silently
-    desync, and importing it from `hindsight_api.config` fails in standalone
-    venvs (e.g. `uvx hindsight-embed`) where `hindsight-api` isn't installed.
+
+def get_config() -> dict[str, str]:
+    """This invocation's daemon overrides, as ``HINDSIGHT_*`` environment variables.
+
+    Every ``HINDSIGHT_*`` variable in the process environment is forwarded
+    verbatim; there is no whitelist of known settings. A whitelist is exactly
+    how ``HINDSIGHT_API_LLM_BASE_URL`` came to be dropped while KEY/MODEL
+    applied (issue #4094) — ``hindsight-api``, not this wrapper, owns the list
+    of settings that exist, and it grows every release.
+
+    No provider or model default is injected: ``hindsight-api`` resolves both
+    (its ``DEFAULT_LLM_PROVIDER`` is this same ``"openai"``, and
+    ``PROVIDER_DEFAULT_MODELS`` is provider-keyed). Duplicating those tables
+    here would silently desync — and importing them fails in standalone venvs
+    (``uvx hindsight-embed``) where ``hindsight-api`` isn't installed anyway.
     """
     load_config_file()
-    provider = os.environ.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
-    return {
-        "llm_api_key": (
-            None
-            if provider in NO_API_KEY_PROVIDERS
-            else os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        ),
-        "llm_provider": provider,
-        "llm_model": os.environ.get("HINDSIGHT_API_LLM_MODEL"),
-    }
+    config = {key: value for key, value in os.environ.items() if key.startswith("HINDSIGHT_")}
+
+    # OPENAI_API_KEY is the one non-HINDSIGHT_ name honoured here, and only for
+    # providers that authenticate with an LLM API key at all.
+    provider = config.get(ENV_LLM_PROVIDER) or "openai"
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key and ENV_LLM_API_KEY not in config and provider not in NO_API_KEY_PROVIDERS:
+        config[ENV_LLM_API_KEY] = openai_key
+
+    return config
 
 
 # Provider -> API-key env var (None = no key needed)
@@ -247,15 +256,24 @@ def _do_configure_from_env():
     # Save configuration
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    config_values = {"HINDSIGHT_API_LLM_PROVIDER": provider}
-    if model:
-        config_values["HINDSIGHT_API_LLM_MODEL"] = model
+    # Persist every HINDSIGHT_API_* variable the caller set, not a hand-listed
+    # subset: the subset is why HINDSIGHT_API_LLM_BASE_URL never reached the
+    # written profile (issue #4094). HINDSIGHT_EMBED_* is deliberately excluded
+    # — those configure this wrapper for one invocation (API URL, component
+    # versions), and baking them into the profile is not what a user setting
+    # them for a single `configure` run asked for.
+    config_values = {key: value for key, value in os.environ.items() if key.startswith("HINDSIGHT_API_") and value}
+    config_values[ENV_LLM_PROVIDER] = provider
     if api_key:
-        config_values["HINDSIGHT_API_LLM_API_KEY"] = api_key
+        config_values[ENV_LLM_API_KEY] = api_key
+    else:
+        # Providers in NO_API_KEY_PROVIDERS authenticate locally; don't persist
+        # a stale key that the resolved provider will never use.
+        config_values.pop(ENV_LLM_API_KEY, None)
 
     from .env_template import render_config
 
-    CONFIG_FILE.write_text(render_config(config_values))
+    CONFIG_FILE.write_text(render_config(config_values), encoding="utf-8")
     CONFIG_FILE.chmod(0o600)
 
     print()
@@ -442,7 +460,7 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
         # Save to default profile
         from .env_template import render_config
 
-        CONFIG_FILE.write_text(render_config(config_dict))
+        CONFIG_FILE.write_text(render_config(config_dict), encoding="utf-8")
         CONFIG_FILE.chmod(0o600)
 
     # Stop existing daemon if running (it needs to pick up new config)
@@ -454,12 +472,7 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
         daemon_client.stop_daemon(daemon_profile)
 
     # Start daemon with new config
-    new_config = {
-        "llm_api_key": api_key,
-        "llm_provider": provider,
-        "llm_model": model,
-    }
-    if daemon_client.ensure_daemon_running(new_config, daemon_profile):
+    if daemon_client.ensure_daemon_running(dict(config_dict), daemon_profile):
         print("  \033[32m✓ Daemon started\033[0m")
     else:
         print("  \033[33m⚠ Failed to start daemon (will start on first command)\033[0m")
@@ -676,7 +689,7 @@ def do_daemon(args, config: dict, logger):
         else:
             # Show last N lines
             try:
-                with open(daemon_log_path) as f:
+                with open(daemon_log_path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
                     for line in lines[-args.lines :]:
                         print(line, end="")
@@ -838,7 +851,7 @@ def do_ui(args, config: dict, logger):
             return 0
         else:
             try:
-                with open(ui_log_path) as f:
+                with open(ui_log_path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
                     for line in lines[-args.lines :]:
                         print(line, end="")
@@ -1057,7 +1070,7 @@ def do_control(args) -> int:
             except KeyboardInterrupt:
                 pass
             return 0
-        with open(log_path) as f:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
             for line in f.readlines()[-getattr(args, "lines", 50) :]:
                 print(line, end="")
         return 0
@@ -1216,7 +1229,7 @@ def do_profile_command(args: list[str]) -> int:
                 config_path = CONFIG_FILE
 
             if config_path.exists():
-                for line in config_path.read_text().splitlines():
+                for line in config_path.read_text(encoding="utf-8").splitlines():
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:
                         k, v = line.split("=", 1)
@@ -1268,7 +1281,7 @@ def do_profile_command(args: list[str]) -> int:
         # Parse existing config
         config = {}
         if config_path.exists():
-            for line in config_path.read_text().splitlines():
+            for line in config_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
@@ -1313,7 +1326,7 @@ def do_profile_command(args: list[str]) -> int:
         # Parse existing config
         config = {}
         if config_path.exists():
-            for line in config_path.read_text().splitlines():
+            for line in config_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)

@@ -19,9 +19,11 @@ Entity expansion is bounded by graph_per_entity_limit (LATERAL cap per entity).
 A timeout fallback (graph_expansion_timeout) drops entity expansion entirely if the
 query still exceeds the budget.
 
-For non-observation fact types the three expansions are issued as a single CTE query
-(one roundtrip, one connection) with a `source` discriminator column so the Python
-merge step can apply per-signal score transformations.
+All fact types — observation and non-observation — are expanded as a single CTE
+query (one roundtrip, one connection) with a `source` discriminator column so the
+Python merge step can apply per-signal score transformations. For non-observation
+types the three arms share one CTE chain directly; for observations the
+entity/source traversal is fused into the semantic/causal CTE query (#3857).
 """
 
 import asyncio
@@ -37,7 +39,7 @@ from ..db_utils import acquire_with_retry
 from ..memory_engine import fq_table
 from .graph_retrieval import GraphRetriever
 from .tags import TagGroup, TagsMatch, filter_results_by_tag_groups, filter_results_by_tags
-from .types import GraphRetrievalTimings, RetrievalResult
+from .types import GraphRetrieval, GraphRetrievalTimings, RetrievalResult
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,9 @@ async def _find_semantic_seeds(
 
     tags_clause = build_tags_where_clause_simple(tags, 6, match=tags_match)
     tag_groups_param_start = 6 + (1 if tags else 0)
-    groups_clause, groups_params, _ = build_tag_groups_where_clause(tag_groups, tag_groups_param_start)
+    built = build_tag_groups_where_clause(tag_groups, tag_groups_param_start)
+    groups_clause = built.sql
+    groups_params = built.params
 
     # created_after/created_before filter `updated_at`, matching the other recall arms
     # (see retrieval.py) so a window narrows every arm the same way.
@@ -112,9 +116,9 @@ class LinkExpansionRetriever(GraphRetriever):
     Runs three expansions through precomputed memory_links: entity co-occurrence,
     semantic kNN, and causal chains, all bounded at retain time.
 
-    For non-observation fact types the three expansions are issued as a single CTE
-    query (one roundtrip, one connection slot) with a `source` discriminator column.
-    The Python merge step applies per-signal score transformations.
+    Every fact type is expanded as a single CTE query (one roundtrip, one
+    connection slot) with a `source` discriminator column. The Python merge step
+    applies per-signal score transformations.
     """
 
     def __init__(self):
@@ -139,7 +143,7 @@ class LinkExpansionRetriever(GraphRetriever):
         created_after: "datetime | None" = None,
         created_before: "datetime | None" = None,
         preselected_semantic_seeds: list[RetrievalResult] | None = None,
-    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:
+    ) -> GraphRetrieval:
         """
         Retrieve facts by expanding links from seeds.
 
@@ -192,7 +196,7 @@ class LinkExpansionRetriever(GraphRetriever):
             )
 
             if not all_seeds:
-                return [], timings
+                return GraphRetrieval([], timings)
 
             seed_ids = list({s.id for s in all_seeds})
             timings.pattern_count = len(seed_ids)
@@ -288,7 +292,7 @@ class LinkExpansionRetriever(GraphRetriever):
             f"in {timings.traverse * 1000:.1f}ms (query: {timings.edge_load_time * 1000:.1f}ms)"
         )
 
-        return results, timings
+        return GraphRetrieval(results, timings)
 
     async def _expand_combined(
         self,
@@ -381,7 +385,9 @@ class LinkExpansionRetriever(GraphRetriever):
         by consolidation, not retain).  Instead, traverse source_memory_ids → world
         facts → entities → other world facts → their observations.
 
-        Semantic and causal expansions run as a second combined CTE query.
+        The entity/source traversal is fused into the semantic/causal CTE query
+        (#3857): one fetch carries all three arms behind a `source` discriminator,
+        which DataAccessOps.expand_observations splits into per-signal rows.
         """
         source_ids_found: list = []
         if logger.isEnabledFor(logging.DEBUG):

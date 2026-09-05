@@ -13,13 +13,17 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from ...cancellation import OperationCancelledError
 from ...config import get_config
 from ..llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
+from ..llm_trace import LLMQueueWait, reset_queue_wait_sink, set_queue_wait_sink
+from ..llm_transport import describe_llm_error
 from .models import DirectiveInfo, LLMCall, ReflectAgentResult, StructuredOutputResult, TokenUsageSummary, ToolCall
 from .prompts import (
     _SPLIT_SYNTHESIS_WARN_CHUNKS,
     CLAIMS_SYSTEM_PROMPT,
     _extract_directive_rules,
+    build_agent_user_prompt,
     build_chunk_claims_prompt,
     build_final_prompt,
     build_final_system_prompt,
@@ -61,6 +65,22 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ITERATIONS = 10
 
+#: Temperature for split synthesis's map calls. They copy claims and ids out of one
+#: chunk — the mechanical half of the job, like consolidation's extraction passes,
+#: which also run at 0. The reflect temperature (0.9 by default) belongs to the calls
+#: that reason and write; at that setting a map call sometimes answered a plainly
+#: relevant chunk with the six-token "(no relevant evidence)" sentinel and
+#: finish_reason=stop, dropping that chunk's evidence from the reduce (#4054).
+#:
+#: Applied only when a reflect temperature is configured at all: ``none`` resolves the
+#: whole chain to None so the parameter is omitted, which is how reasoning models that
+#: reject any temperature are run. Hardcoding 0 here would put it back for them.
+_MAP_TEMPERATURE = 0.0
+
+
+def _map_temperature() -> float | None:
+    return None if get_config().llm_temperature_reflect is None else _MAP_TEMPERATURE
+
 
 class ReflectNoAnswerError(RuntimeError):
     """The agent finished without producing an answer.
@@ -87,6 +107,27 @@ class ReflectToolCallError(RuntimeError):
     mimic a ``done`` payload. Rather than salvage that untooled text -- and risk
     surfacing raw tool-call JSON as the answer -- we fail loudly so the caller can
     switch to a tool-calling-capable model/transport.
+    """
+
+
+class ReflectToolExecutionError(RuntimeError):
+    """A retrieval tool raised, so the run's evidence set is incomplete.
+
+    Reflect used to hand the exception text back to the model as a tool result and
+    let the loop continue. The model then answered from whatever it happened to
+    have -- often nothing -- and that answer was indistinguishable from a run over
+    a bank that genuinely holds nothing on the topic. A mental-model refresh wrote
+    it, replacing a document built across months with "I don't have information
+    about that" and recording the operation as ``completed`` (#2894).
+
+    A failed tool is an infrastructure failure (the database, the embedder, the
+    reranker), not something the model can fix by rephrasing, so the run fails
+    instead: callers that write what reflect returns never reach the write, and
+    the refresh preserves its document and its watermark.
+
+    This covers tools that *raised*. A tool that returns ``{"error": ...}`` for a
+    malformed or unavailable call is the model's mistake, is fixable by retrying
+    with different arguments, and is still fed back to it as before.
     """
 
 
@@ -235,7 +276,7 @@ INSTRUCTIONS:
 
 OUTPUT:"""
 
-        structured_result, usage = await llm_config.call(
+        call_result = await llm_config.call(
             messages=[
                 {
                     "role": "system",
@@ -246,13 +287,17 @@ OUTPUT:"""
             response_format=DynamicModel,
             scope="reflect_structured",
             strict_schema=get_config().llm_strict_schema_reflect,
+            # Schema extraction should be deterministic. The configured reflect
+            # temperature applies to answer generation, not this parsing pass.
+            temperature=0.0,
             max_completion_tokens=max_tokens,
             max_retries=1,
             initial_backoff=0.25,
             max_backoff=1.0,
             skip_validation=True,  # We'll handle the dict ourselves
-            return_usage=True,
         )
+        structured_result = call_result.content
+        usage = call_result.usage
 
         # Convert to dict
         if hasattr(structured_result, "model_dump"):
@@ -522,6 +567,7 @@ async def _run_reflect_agent_inner(
         include_recall=include_recall,
         include_expand=include_expand,
         answer_as_document=answer_as_document,
+        llm_output_language=llm_output_language,
     )
     # Build set of enabled tool names to guard against LLM hallucinating disabled tool calls
     enabled_tools: frozenset[str] = frozenset(t["function"]["name"] for t in tools if t.get("type") == "function")
@@ -535,10 +581,11 @@ async def _run_reflect_agent_inner(
         include_observations=include_observations,
         budget=budget,
         answer_as_document=answer_as_document,
+        llm_output_language=llm_output_language,
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query},
+        {"role": "user", "content": build_agent_user_prompt(query, llm_output_language)},
     ]
 
     # Step-by-step context caching for the agentic tool loop.
@@ -658,7 +705,13 @@ async def _run_reflect_agent_inner(
             )
             or "none"
         )
-        llm_summary = ", ".join(f"{c['scope']}={c['duration_ms']}ms" for c in llm_trace) or "none"
+        llm_summary = (
+            ", ".join(
+                f"{c['scope']}={c['duration_ms']}ms" + (f"(q{c['queued_ms']}ms)" if c.get("queued_ms") else "")
+                for c in llm_trace
+            )
+            or "none"
+        )
         total_llm_ms = sum(c["duration_ms"] for c in llm_trace)
         total_tools_ms = sum(t["duration_ms"] for t in tool_trace_summary)
 
@@ -674,19 +727,31 @@ async def _run_reflect_agent_inner(
             f"total={elapsed_ms}ms"
         )
 
-    async def _tracked_llm_call(prompt: str, trace_scope: str, system_prompt: str, completion_cap: int | None) -> str:
-        """One tool-less LLM call with usage/trace accounting folded in."""
+    async def _tracked_llm_call(
+        prompt: str,
+        trace_scope: str,
+        system_prompt: str,
+        completion_cap: int | None,
+        temperature: float | None = None,
+    ) -> str:
+        """One tool-less LLM call with usage/trace accounting folded in.
+
+        ``temperature`` defaults to the reflect temperature, which is tuned for
+        writing an answer; callers that extract rather than write override it.
+        """
         nonlocal total_input_tokens, total_output_tokens, total_cached_tokens, total_thoughts_tokens
         llm_start = time.time()
-        response, usage = await llm_config.call(
+        call_result = await llm_config.call(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             scope="reflect",
+            temperature=get_config().llm_temperature_reflect if temperature is None else temperature,
             max_completion_tokens=completion_cap,
-            return_usage=True,
         )
+        response = call_result.content
+        usage = call_result.usage
         llm_duration = int((time.time() - llm_start) * 1000)
         total_input_tokens += usage.input_tokens
         total_output_tokens += usage.output_tokens
@@ -729,6 +794,7 @@ async def _run_reflect_agent_inner(
                 context,
                 max_context_tokens=max_context_tokens,
                 max_tokens=max_tokens,
+                llm_output_language=llm_output_language,
             )
             answer = await _tracked_llm_call(prompt, "final", final_system, synthesis_max_completion_tokens)
         else:
@@ -745,12 +811,20 @@ async def _run_reflect_agent_inner(
                         f"final_map_{i}",
                         CLAIMS_SYSTEM_PROMPT,
                         synthesis_max_completion_tokens,
+                        temperature=_map_temperature(),
                     )
                     for i, chunk in enumerate(chunks, 1)
                 )
             )
             # Reduce: one synthesis call over every chunk's claims.
-            prompt = build_reduce_prompt(query, list(claim_sections), bank_profile, context, max_tokens=max_tokens)
+            prompt = build_reduce_prompt(
+                query,
+                list(claim_sections),
+                bank_profile,
+                context,
+                max_tokens=max_tokens,
+                llm_output_language=llm_output_language,
+            )
             answer = await _tracked_llm_call(prompt, "final", final_system, synthesis_max_completion_tokens)
 
         if not (answer or "").strip():
@@ -861,18 +935,25 @@ async def _run_reflect_agent_inner(
             await _resolve_pending_cache()
 
         call_msg_count = len(messages)
+        # Time spent waiting on LLM concurrency permits is collected separately so a
+        # long `agent_N` entry can be read as "the provider was slow" and nothing
+        # else -- see llm_trace.set_queue_wait_sink (#3881).
+        queue_wait = LLMQueueWait()
+        queue_token = set_queue_wait_sink(queue_wait)
         try:
             ct_kwargs: dict[str, Any] = dict(
                 messages=messages,
                 tools=tools,
                 scope="reflect_tool_call",
                 tool_choice=iter_tool_choice,
+                temperature=get_config().llm_temperature_reflect,
             )
             if incremental_caching and iter_tool_choice is LLM_TOOL_CHOICE_AUTO and rolling_cache_name is not None:
                 ct_kwargs["cached_prefix"] = rolling_cache_name
                 ct_kwargs["cached_prefix_message_count"] = rolling_cache_boundary
             result = await llm_config.call_with_tools(**ct_kwargs)
             llm_duration = int((time.time() - llm_start) * 1000)
+            queued_ms = int(queue_wait.seconds * 1000)
             consecutive_errors = 0
             total_input_tokens += result.input_tokens
             total_output_tokens += result.output_tokens
@@ -882,30 +963,49 @@ async def _run_reflect_agent_inner(
                 {
                     "scope": f"agent_{iteration + 1}",
                     "duration_ms": llm_duration,
+                    "queued_ms": queued_ms,
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
                 }
             )
 
+        except OperationCancelledError:
+            # A cancellation is not a provider failure: never retried, never
+            # synthesized around, and it must reach the HTTP layer as itself so a
+            # client disconnect stays a 499 (issue #2122).
+            raise
         except Exception as e:
             err_duration = int((time.time() - llm_start) * 1000)
+            queued_ms = int(queue_wait.seconds * 1000)
             consecutive_errors += 1
-            logger.warning(f"[REFLECT {reflect_id}] LLM error on iteration {iteration + 1}: {e} ({err_duration}ms)")
-            llm_trace.append({"scope": f"agent_{iteration + 1}_err", "duration_ms": err_duration})
-            has_gathered_evidence = (
-                bool(available_memory_ids) or bool(available_mental_model_ids) or bool(available_observation_ids)
+            logger.warning(
+                f"[REFLECT {reflect_id}] LLM error on iteration {iteration + 1}: {describe_llm_error(e)} "
+                f"({err_duration}ms, {queued_ms}ms queued)"
+            )
+            llm_trace.append(
+                {"scope": f"agent_{iteration + 1}_err", "duration_ms": err_duration, "queued_ms": queued_ms}
             )
             # Context overflow errors must never be retried — retrying would only make them worse.
-            # Skip straight to final synthesis with whatever evidence we have.
+            # Skip straight to final synthesis with whatever evidence we have: the
+            # prompt was too big for the model, which is a budgeting problem, not a
+            # broken dependency, and the evidence gathered so far is intact.
             if _is_context_overflow_error(e):
                 logger.warning(
                     f"[REFLECT {reflect_id}] Context window exceeded on iteration {iteration + 1}, "
                     "forcing final synthesis from gathered evidence."
                 )
-            # For other errors: retry if no evidence yet (but cap consecutive errors to avoid long hangs)
-            elif not has_gathered_evidence and iteration < max_iterations - 1 and consecutive_errors < 2:
+                return await _forced_final_synthesis(iteration + 1)
+            # Any other error: retry (capped, so a persistently failing provider does
+            # not hang the run), then give up. Synthesizing an answer here instead
+            # would be built on an evidence set the failed turn never finished
+            # gathering, and callers cannot tell that from a complete one (#2894).
+            # The provider's own retries (429/5xx) already ran inside the call.
+            if iteration < max_iterations - 1 and consecutive_errors < 2:
                 continue
-            return await _forced_final_synthesis(iteration + 1)
+            raise
+
+        finally:
+            reset_queue_wait_sink(queue_token)
 
         # No tool calls this turn.
         if not result.tool_calls:
@@ -995,17 +1095,23 @@ async def _run_reflect_agent_inner(
         # Execute other tools in parallel (exclude done tool in all its format variants)
         other_tools = [tc for tc in result.tool_calls if not _is_done_tool(tc.name)]
         if other_tools:
-            # Partition into enabled vs hallucinated (not in enabled_tools set)
+            # Partition into enabled vs hallucinated (not in enabled_tools set),
+            # carrying each call's position in the model's original batch so the
+            # results can be re-emitted in that order below.
             allowed_tools = []
+            allowed_positions: list[int] = []
             hallucinated_tools = []
-            for tc in other_tools:
+            hallucinated_positions: list[int] = []
+            for position, tc in enumerate(other_tools):
                 norm = _normalize_tool_name(tc.name)
                 # "done" is always available. "expand" is governed by enabled_tools
                 # (it is excluded when text storage is disabled), so it is not hardcoded here.
                 if enabled_tools is not None and norm not in enabled_tools and norm != "done":
                     hallucinated_tools.append(tc)
+                    hallucinated_positions.append(position)
                 else:
                     allowed_tools.append(tc)
+                    allowed_positions.append(position)
 
             # Build assistant message with all tool calls (LLM requires them for history)
             messages.append(
@@ -1015,19 +1121,23 @@ async def _run_reflect_agent_inner(
                 }
             )
 
-            # Immediately reject hallucinated tool calls without adding to trace
-            for tc in hallucinated_tools:
-                messages.append(
+            # Serialize tool results in the ORIGINAL tool_calls order. Anthropic
+            # requires tool_result blocks to match the assistant tool_use order,
+            # so collect every result first and emit them in the model's order
+            # after execution (execution order may differ).
+            #
+            # Slots are indexed by POSITION, never by tool_call_id: a
+            # non-conforming OpenAI-compatible gateway can hand back duplicate or
+            # empty ids for a parallel batch, and an id-keyed map would silently
+            # drop one tool's evidence and duplicate another's.
+            ordered_tool_calls = list(other_tools)
+            tool_outputs: list[str] = [""] * len(ordered_tool_calls)
+            for position, tc in zip(hallucinated_positions, hallucinated_tools):
+                tool_outputs[position] = json.dumps(
                     {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": json.dumps(
-                            {
-                                "error": f"Tool '{_normalize_tool_name(tc.name)}' is not available. Use only the tools provided to you."
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
+                        "error": f"Tool '{_normalize_tool_name(tc.name)}' is not available. Use only the tools provided to you."
+                    },
+                    ensure_ascii=False,
                 )
 
             other_tools = allowed_tools
@@ -1058,14 +1168,24 @@ async def _run_reflect_agent_inner(
             total_tools_called += len(other_tools)
 
             # Process results and add to messages
-            for tc, result_data in zip(other_tools, tool_results):
+            for position, tc, result_data in zip(allowed_positions, other_tools, tool_results):
+                if isinstance(result_data, OperationCancelledError):
+                    # The client went away mid-tool (recall propagates this — see
+                    # issue #2122). Let it through untouched so the HTTP layer still
+                    # returns 499; wrapping it would report a cancellation as a 500.
+                    raise result_data
                 if isinstance(result_data, Exception):
-                    # Tool execution failed - send error back to LLM so it can try again
+                    # A tool that raised is an infrastructure failure, not something
+                    # the model can retry its way out of. Feeding it back as a tool
+                    # result let the loop answer from an evidence set it knows is
+                    # incomplete, and nothing downstream could tell that answer from
+                    # one over an empty bank -- see ReflectToolExecutionError (#2894).
                     logger.warning(f"[REFLECT {reflect_id}] Tool {tc.name} failed with exception: {result_data}")
-                    output = {"error": f"Tool execution failed: {result_data}"}
-                    duration_ms = 0
-                else:
-                    output, duration_ms = result_data
+                    raise ReflectToolExecutionError(
+                        f"Reflect tool '{_normalize_tool_name(tc.name)}' failed on iteration {iteration + 1}: "
+                        f"{result_data}"
+                    ) from result_data
+                output, duration_ms = result_data
 
                 # Normalize tool name for consistent tracking
                 normalized_tool_name = _normalize_tool_name(tc.name)
@@ -1119,14 +1239,8 @@ async def _run_reflect_agent_inner(
                         if "id" in memory:
                             available_memory_ids.add(memory["id"])
 
-                # Add tool result message
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": json.dumps(output, default=str, ensure_ascii=False),
-                    }
-                )
+                # Record the serialized result; emitted in original order below.
+                tool_outputs[position] = json.dumps(output, default=str, ensure_ascii=False)
 
                 # Track for logging and context history
                 input_dict = {"tool": tc.name, **tc.arguments}
@@ -1162,6 +1276,18 @@ async def _run_reflect_agent_inner(
 
                 # Keep context history for fallback final prompt
                 context_history.append({"tool": tc.name, "input": input_dict, "output": output})
+
+            # Emit tool_result messages in the assistant tool_calls order so the
+            # serialized history matches the tool_use blocks (Anthropic requires
+            # tool_result blocks in the same order as the corresponding tool_use).
+            for tc, tool_output in zip(ordered_tool_calls, tool_outputs):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_output,
+                    }
+                )
 
     # Unreachable in practice: the last iteration returns the forced synthesis
     # above, so the loop cannot fall out of the bottom. Kept as a hard failure
@@ -1290,15 +1416,17 @@ async def _process_done_tool(
             )
             rewrite_user = f"Target budget: {max_tokens} tokens.\n\nText to rewrite:\n{answer}"
 
-        rewritten, rewrite_usage = await llm_config.call(
+        call_result = await llm_config.call(
             messages=[
                 {"role": "system", "content": rewrite_system},
                 {"role": "user", "content": rewrite_user},
             ],
             scope="reflect",
+            temperature=get_config().llm_temperature_reflect,
             max_completion_tokens=get_config().reflect_max_completion_tokens,
-            return_usage=True,
         )
+        rewritten = call_result.content
+        rewrite_usage = call_result.usage
         if document is not None:
             trimmed = _document_from_rewrite(rewritten, answer)
             document, answer = trimmed.structure, trimmed.markdown

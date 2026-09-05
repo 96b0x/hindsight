@@ -18,7 +18,8 @@ from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.memory_engine import MentalModelRefreshError
 from hindsight_api.engine.reflect import agent as reflect_agent
 from hindsight_api.engine.reflect.delta_ops import DeltaOperationList
-from hindsight_api.engine.response_models import ReflectResult
+from hindsight_api.engine.response_models import LLMCallResult, ReflectResult, TokenUsage
+from tests.conftest import stub_refresh_has_sources
 
 _SCHEMA = {
     "type": "object",
@@ -84,6 +85,7 @@ class TestMentalModelStructuredOutput:
             return _canned_reflect_result("# Team\n\nRegenerated answer.")
 
         monkeypatch.setattr(memory, "reflect_async", fake_reflect_async)
+        stub_refresh_has_sources(monkeypatch, memory)
         so_calls = _patch_structured_output(monkeypatch, {"summary": "A team."})
 
         refreshed = await memory.refresh_mental_model(
@@ -115,6 +117,7 @@ class TestMentalModelStructuredOutput:
             return _canned_reflect_result("# Team\n\nRegenerated.")
 
         monkeypatch.setattr(memory, "reflect_async", fake_reflect_async)
+        stub_refresh_has_sources(monkeypatch, memory)
         so_calls = _patch_structured_output(monkeypatch, {"summary": "x"})
 
         refreshed = await memory.refresh_mental_model(
@@ -149,11 +152,12 @@ class TestMentalModelStructuredOutput:
             )
 
         monkeypatch.setattr(memory, "reflect_async", fake_reflect_async)
+        stub_refresh_has_sources(monkeypatch, memory)
 
         # Delta-ops call returns no operations → the document is preserved and
         # re-rendered, so final_content is the merged doc (here: the original).
         async def fake_delta_call(**kwargs):
-            return DeltaOperationList(operations=[])
+            return LLMCallResult(content=DeltaOperationList(operations=[]), usage=TokenUsage())
 
         monkeypatch.setattr(memory._reflect_llm_config, "call", fake_delta_call)
         so_calls = _patch_structured_output(monkeypatch, {"summary": "whole document"})
@@ -190,6 +194,7 @@ class TestMentalModelStructuredOutput:
             return _canned_reflect_result("# Doc\n\nBrand new content.")
 
         monkeypatch.setattr(memory, "reflect_async", fake_reflect_async)
+        stub_refresh_has_sources(monkeypatch, memory)
         # Extraction "fails": returns no structured output.
         _patch_structured_output(monkeypatch, None)
 

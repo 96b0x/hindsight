@@ -38,9 +38,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 from hindsight_api.engine.llm_wrapper import parse_llm_json
 
@@ -62,6 +63,31 @@ logger = logging.getLogger(__name__)
 
 class _OpBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+def _coerce_block_texts(value: Any) -> Any:
+    """Accept a new block written as ``{"id": ..., "text": ...}`` where a string is expected.
+
+    The document the model is shown gives every existing block an ``id``, and
+    half the operations address blocks *by* ``block_id``. A model that has just
+    read that structure emits ids for the blocks it creates too; the prompt's
+    bare-string example is the only thing saying otherwise, and #3901 is 74
+    ``add_section`` ops over 30 hours where that was not enough. Because this
+    call is deliberately text-mode (the discriminated-union schema is not
+    accepted by every provider — see the call site in ``memory_engine``), the
+    prompt is the only lever there is, so the parser absorbs the second spelling
+    instead of paying a full reflect to reject it.
+
+    The id is *dropped*, not honoured: ``apply_operations`` mints ids for new
+    blocks with ``make_block_id`` against the ids already reserved in this batch,
+    and taking the model's would reintroduce exactly the collisions that scheme
+    exists to prevent. Nothing else is rewritten — an entry that is neither a
+    string nor a ``{"text": ...}`` object is passed through so it still fails
+    with its own validation error rather than being quietly discarded.
+    """
+    if not isinstance(value, list):
+        return value
+    return [item["text"] if isinstance(item, dict) and isinstance(item.get("text"), str) else item for item in value]
 
 
 class AppendBlockOp(_OpBase):
@@ -117,6 +143,11 @@ class AddSectionOp(_OpBase):
     after_section_id: str | None = None
     new_id: str | None = None
 
+    @field_validator("blocks", mode="before")
+    @classmethod
+    def _accept_id_bearing_blocks(cls, value: Any) -> Any:
+        return _coerce_block_texts(value)
+
 
 class RemoveSectionOp(_OpBase):
     """Remove an entire section by id."""
@@ -136,6 +167,11 @@ class ReplaceSectionBlocksOp(_OpBase):
     op: Literal["replace_section_blocks"] = "replace_section_blocks"
     section_id: str
     blocks: list[str] = Field(default_factory=list)
+
+    @field_validator("blocks", mode="before")
+    @classmethod
+    def _accept_id_bearing_blocks(cls, value: Any) -> Any:
+        return _coerce_block_texts(value)
 
 
 class RenameSectionOp(_OpBase):
@@ -167,7 +203,22 @@ _OPERATION_ADAPTER: TypeAdapter[Operation] = TypeAdapter(Operation)
 _BODY_FIELDS = ("text", "blocks")
 
 
-def _validate_operations_list(raw_ops: Any) -> tuple[list[Operation], list[dict[str, Any]]]:
+@dataclass(frozen=True)
+class ValidatedOperations:
+    """The surviving and rejected halves of one LLM operation list.
+
+    Both halves are lists and both are non-empty in the interesting cases, so as a
+    bare tuple they were transposable without a type error — and the caller feeds
+    them to ``_finalize_operations``, which raises ``DeltaAllOpsInvalidError`` off
+    the *valid* half being empty while the *skipped* half is not. Swapped, a clean
+    refresh would abort and a fully-malformed one would be applied.
+    """
+
+    valid: list[Operation]
+    skipped: list[dict[str, Any]]
+
+
+def _validate_operations_list(raw_ops: Any) -> ValidatedOperations:
     """Validate each operation independently; drop invalid ops instead of failing the batch."""
     if not isinstance(raw_ops, list):
         raise TypeError(f"operations must be a list, got {type(raw_ops)!r}")
@@ -183,7 +234,7 @@ def _validate_operations_list(raw_ops: Any) -> tuple[list[Operation], list[dict[
                 i,
                 exc.errors(include_url=False),
             )
-    return valid, skipped
+    return ValidatedOperations(valid, skipped)
 
 
 class DeltaOperationList(BaseModel):
@@ -198,8 +249,17 @@ class DeltaAllOpsInvalidError(ValueError):
 
     Distinct from an empty ``operations`` array (a legitimate no-op): here every
     op was malformed, so returning zero valid ops would make the caller apply
-    nothing and silently drop this refresh's new facts. Raising instead lets the
-    caller fall back to a full rewrite, which still integrates the new facts.
+    nothing while recording a clean refresh, silently dropping this refresh's
+    new facts.
+
+    Raising does *not* buy a full rewrite — the caller catches it, records
+    ``delta_ops_failed`` and refuses to write, because the reflect candidate
+    covers only memories newer than the last refresh and writing it would drop
+    the rest of the document. So the document is preserved and the refresh is
+    reported as failed; the facts arrive on a later round. That makes every
+    raise here the cost of a discarded reflect call, which is why predictable
+    model spellings are absorbed in validation (see ``_coerce_block_texts``)
+    rather than left to fail.
     """
 
 
@@ -245,7 +305,8 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
         return raw
     if isinstance(raw, dict):
         ops_raw = raw.get("operations", [])
-        valid, skipped = _validate_operations_list(ops_raw)
+        validated = _validate_operations_list(ops_raw)
+        valid, skipped = validated.valid, validated.skipped
         if skipped:
             logger.info(
                 "[STRUCTURED_DELTA] parsed %s op(s), skipped %s invalid op(s) from dict payload",
@@ -270,11 +331,14 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
         except json.JSONDecodeError as exc:
             last_error = exc
             continue
+        if isinstance(payload, list):
+            payload = {"operations": payload}
         if not isinstance(payload, dict) or "operations" not in payload:
             last_error = ValueError("delta payload must be an object with an operations array")
             continue
         try:
-            valid, skipped = _validate_operations_list(payload["operations"])
+            validated = _validate_operations_list(payload["operations"])
+            valid, skipped = validated.valid, validated.skipped
         except TypeError as exc:
             last_error = exc
             continue

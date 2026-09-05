@@ -77,7 +77,7 @@ docker run -it --pull always --name hindsight --restart unless-stopped -p 8888:8
 >API: http://localhost:8888
 >UI: http://localhost:9999
 
-Hindsight works with **25+ LLM providers** via `HINDSIGHT_API_LLM_PROVIDER` — hosted (`openai`, `anthropic`, `gemini`, `groq`, `bedrock`, `vertexai`, `minimax`, `deepseek`, `atlas`, …), fully local (`ollama`, `lmstudio`, `llamacpp`), any OpenAI-compatible endpoint, and gateways (`litellm`, `litellmrouter`) that reach the rest. Existing subscriptions work too: `openai-codex` (ChatGPT Plus/Pro), `claude-code` (Claude Pro/Max) and `github-copilot` (GitHub Copilot) need no API key. See [supported models](https://hindsight.vectorize.io/developer/models).
+Hindsight works with **25+ LLM providers** via `HINDSIGHT_API_LLM_PROVIDER` — hosted (`openai`, `anthropic`, `gemini`, `groq`, `bedrock`, `vertexai`, `minimax`, `deepseek`, `atlas`, `meta`, …), fully local (`ollama`, `lmstudio`, `llamacpp`), any OpenAI-compatible endpoint, and gateways (`litellm`, `litellmrouter`) that reach the rest. Existing subscriptions work too: `openai-codex` (ChatGPT Plus/Pro), `claude-code` (Claude Pro/Max) and `github-copilot` (GitHub Copilot) need no API key. See [supported models](https://hindsight.vectorize.io/developer/models).
 
 #### Docker (external PostgreSQL)
 
@@ -254,7 +254,7 @@ npx @vectorize-io/hindsight-coding-agents install all          # every detected 
 npx @vectorize-io/hindsight-coding-agents install claude-code  # or just one
 ```
 
-Supports Claude Code, Codex CLI, Cursor CLI, GitHub Copilot CLI, opencode, Kilo CLI, Cline CLI, Antigravity CLI, Devin CLI, Prime Agent, Grok Build and DeepSeek Harness. Ingestion is automatic — there is no setup command. See the [coding agents integration](https://hindsight.vectorize.io/sdks/integrations/coding-agents).
+Supports Claude Code, Codex CLI, Cursor CLI, GitHub Copilot CLI, opencode, Kilo CLI, Cline CLI, Antigravity CLI, Devin CLI, pi, Prime Agent, Grok Build and DeepSeek Harness. Ingestion is automatic — there is no setup command. See the [coding agents integration](https://hindsight.vectorize.io/sdks/integrations/coding-agents).
 
 ### MCP Server
 

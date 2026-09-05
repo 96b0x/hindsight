@@ -3,6 +3,7 @@ Pytest configuration and shared fixtures.
 """
 
 import asyncio
+import importlib.util
 import os
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from dotenv import load_dotenv
 # (single-threaded, before any concurrency) makes that registration happen once
 # per worker process. Guarded so slim/no-torch environments still collect.
 try:
+    import sentence_transformers  # noqa: F401
     import torch  # noqa: F401  # eager one-time init; see comment above
 
     # Same class of problem, different torch module. transformers' lazy loader
@@ -50,7 +52,6 @@ try:
     # Importing the whole chain here (single-threaded, at collection time) puts
     # every submodule in sys.modules so later imports are cache hits.
     import transformers  # noqa: F401  # seeds safetensors/tokenizers once
-    import sentence_transformers  # noqa: F401
 except ImportError:
     pass
 
@@ -109,6 +110,28 @@ def _cleanup_leaked_span_recorders():
     for recorder in list(recorders):
         if not any(recorder is known for known in before):
             recorders.remove(recorder)
+
+
+@pytest.fixture(autouse=True)
+def _restore_global_metrics_collector():
+    """Fail-safe for the process-global metrics collector (#3780).
+
+    ``create_metrics_collector()`` swaps the module-global collector in
+    ``hindsight_api.metrics`` for a real ``MetricsCollector``. The API lifespan
+    now restores it on shutdown, but a test that starts the app and never runs
+    shutdown (or calls ``create_metrics_collector()`` itself) still leaves the
+    real collector installed for every test that follows in the same xdist
+    worker. ``NoOpMetricsCollector`` ignores its arguments while the real one
+    compares them, so provider tests that pass a bare ``MagicMock`` usage object
+    then blow up with "'>' not supported between instances of 'MagicMock' and
+    'int'" — in whichever files the worker happened to be given, which is why
+    the failure count moved every time someone added a test.
+    """
+    from hindsight_api import metrics as metrics_module
+
+    before = metrics_module.get_metrics_collector()
+    yield
+    metrics_module.reset_metrics_collector(before)
 
 
 # Default pg0 instance configuration for tests
@@ -478,6 +501,28 @@ def llm_config():
     return LLMConfig.from_env()
 
 
+def _skip_without_local_ml(what: str) -> None:
+    """Skip rather than error when the local ML stack is not installed.
+
+    The ``local-ml`` extra (sentence-transformers, transformers, torch) is optional: a
+    deployment using TEI/OpenAI/Cohere for embeddings and reranking never installs it,
+    and a free-threaded build may deliberately leave it out -- importing
+    ``sentence_transformers`` re-enables the GIL, so a process that wants to stay
+    free-threaded cannot load the local models. (torch, tokenizers, safetensors and
+    transformers are all fine on their own; see ``hindsight_api/_free_threading.py``.)
+
+    Without this, every DB-backed test collapses into an ImportError from deep inside
+    fixture setup ("sentence-transformers is required for LocalSTEmbeddings"), which
+    reads as 1495 broken tests rather than one absent optional dependency.
+    """
+    if importlib.util.find_spec("sentence_transformers") is None:
+        pytest.skip(
+            f"local ML stack not installed; {what} fixture needs the 'local-ml' extra "
+            "(pip install 'hindsight-api-slim[local-ml]')",
+            allow_module_level=False,
+        )
+
+
 @pytest.fixture(scope="session")
 def embeddings(tmp_path_factory, worker_id):
     """
@@ -496,6 +541,7 @@ def embeddings(tmp_path_factory, worker_id):
 
     lock_file = root_tmp_dir / "embeddings_init.lock"
 
+    _skip_without_local_ml("embeddings")
     emb = LocalSTEmbeddings()
 
     # Serialize model initialization across workers
@@ -527,6 +573,7 @@ def cross_encoder(tmp_path_factory, worker_id):
 
     lock_file = root_tmp_dir / "cross_encoder_init.lock"
 
+    _skip_without_local_ml("cross_encoder")
     ce = LocalSTCrossEncoder()
 
     # Serialize model initialization across workers
@@ -646,6 +693,27 @@ async def api_client(memory):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+def stub_refresh_has_sources(monkeypatch, memory) -> None:
+    """Tell a mental-model refresh that its bank holds something to read.
+
+    A refresh whose scope is empty skips the reflect loop outright (#3875): running
+    the agent over nothing is its worst case, not a cheap one. Tests that stub
+    ``reflect_async`` almost always do so on a bank with no memories, where that
+    short-circuit would pre-empt the stub instead of the test exercising it — so any
+    test that fakes retrieval has to say the bank is not empty. Tests that are about
+    the short-circuit itself let the real check run (``TestRefreshSkipsEmptyScope``).
+
+    Answered on the sibling-documents leg, which is the one that runs when no memory
+    is in scope: that is the state these tests are in, and it needs no fake timestamps
+    to line up against a delta window.
+    """
+
+    async def _has_document(*args, **kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(memory, "_bank_has_readable_document", _has_document)
 
 
 def enable_audit_default(memory, enabled: bool) -> None:

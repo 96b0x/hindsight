@@ -13,20 +13,6 @@ import httpx
 from .. import daemon_client
 from ..profile_manager import ENV_API_PORT, ENV_CP_PORT, ProfileManager
 
-# The "simple alias" keys that ProfileManager.load_profile_config injects for
-# backward compatibility. They must never be written back into a profile's
-# .env, or they'd pollute it with lowercase duplicates.
-_ALIAS_KEYS = frozenset(
-    {
-        "llm_api_key",
-        "llm_provider",
-        "llm_model",
-        "llm_base_url",
-        "log_level",
-        "idle_timeout",
-    }
-)
-
 # Env var names the wizard owns. Writing config replaces these; everything else
 # in the profile (idle timeout, bank id, custom keys) is preserved untouched.
 _ENV_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
@@ -179,7 +165,7 @@ def _read_raw_env(name: str) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.exists():
         return env
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -188,10 +174,7 @@ def _read_raw_env(name: str) -> dict[str, str]:
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
-        if key in _ALIAS_KEYS:
-            continue
-        env[key] = value.strip()
+        env[key.strip()] = value.strip()
     return env
 
 
@@ -206,7 +189,7 @@ def _write_raw_env(name: str, env: dict[str, str]) -> None:
     else:
         path = pm.resolve_profile_paths("").config
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+        path.write_text("".join(f"{k}={v}\n" for k, v in env.items()), encoding="utf-8")
     # The .env holds the API key — keep it owner-only.
     path.chmod(0o600)
 
@@ -224,9 +207,9 @@ def list_profiles() -> list[ProfileSummary]:
                 port=info.port,
                 is_active=info.is_active,
                 daemon_running=info.daemon_running,
-                provider=config.get("llm_provider"),
-                model=config.get("llm_model"),
-                has_api_key=bool(config.get("llm_api_key")),
+                provider=config.get(_ENV_PROVIDER),
+                model=config.get(_ENV_MODEL),
+                has_api_key=bool(config.get(_ENV_API_KEY)),
             )
         )
     return summaries
@@ -237,15 +220,15 @@ def get_profile_config(name: str) -> ProfileConfigView:
     name = normalize_profile(name)
     pm = ProfileManager()
     config = pm.load_profile_config(name)
-    api_key = config.get("llm_api_key")
+    api_key = config.get(_ENV_API_KEY)
     paths = pm.resolve_profile_paths(name)
     raw = _read_raw_env(name)
     return ProfileConfigView(
         name=name,
         display_name=_display_name(name),
-        provider=config.get("llm_provider"),
-        model=config.get("llm_model"),
-        base_url=config.get("llm_base_url"),
+        provider=config.get(_ENV_PROVIDER),
+        model=config.get(_ENV_MODEL),
+        base_url=config.get(_ENV_BASE_URL),
         api_key_masked=_mask_key(api_key),
         has_api_key=bool(api_key),
         api_port=paths.port,
@@ -423,7 +406,7 @@ def read_env_file(name: str) -> EnvFileView:
     """
     name = normalize_profile(name)
     path = ProfileManager().resolve_profile_paths(name).config
-    content = path.read_text() if path.exists() else ""
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
     return EnvFileView(
         name=name,
         display_name=_display_name(name),
@@ -441,7 +424,7 @@ def write_env_file(name: str, content: str) -> EnvFileView:
     # Normalize to a trailing newline so the file stays POSIX-clean.
     if content and not content.endswith("\n"):
         content += "\n"
-    path.write_text(content)
+    path.write_text(content, encoding="utf-8")
     path.chmod(0o600)
     return read_env_file(name)
 
@@ -493,7 +476,7 @@ def tail_log(name: str, lines: int = 200, source: str = "daemon") -> LogTailView
         return LogTailView(path=str(path), exists=False, content="")
     # Small logs — reading then slicing is simpler than seeking and is fine for
     # the interactive tail in the UI.
-    tail = path.read_text(errors="replace").splitlines()[-max(lines, 1) :]
+    tail = path.read_text(encoding="utf-8", errors="replace").splitlines()[-max(lines, 1) :]
     return LogTailView(path=str(path), exists=True, content="\n".join(tail))
 
 

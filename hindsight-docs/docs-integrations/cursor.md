@@ -54,10 +54,13 @@ docker run --rm -it --pull always -p 8888:8888 \
 ### What `init` does
 
 - Copies plugin files into `.cursor-plugin/hindsight-memory/`
+- Writes/merges project `.cursor/hooks.json` so Cursor registers the hooks. Cursor only loads hooks from `.cursor/hooks.json` (workspace) or `~/.cursor/hooks.json` (user) — files under `.cursor-plugin/` are not enough on their own. Hooks you already had are preserved, and re-running `init` replaces only Hindsight's own entries.
 - Creates `~/.hindsight/cursor.json` with your connection settings (if the file does not already exist)
 - Writes `.cursor/mcp.json` with the Hindsight MCP endpoint for on-demand tools
 - Use `--force` to overwrite an existing installation
 - Use `--no-mcp` to skip the MCP configuration
+
+`hindsight-cursor uninstall` reverses all of it: the plugin directory, Hindsight's `.cursor/hooks.json` entries, the MCP server entry, the generated session rules file, and its `.gitignore` line.
 
 :::caution
 If you add the plugin to an already-open workspace, **fully quit Cursor and reopen it**. Plugins are loaded at startup — a simple window reload is not enough.
@@ -81,8 +84,11 @@ The plugin uses Cursor's hook system:
 |------|-------|---------|
 | `session_start.py` | `sessionStart` | **Session recall** — query memories, inject as `additionalContext` |
 | `retain.py` | `stop` | **Auto-retain** — extract transcript, POST to Hindsight |
+| `retain.py` | `sessionEnd` | **Final flush** — retain whatever the turn window never got to |
 
 The `sessionStart` hook fires once when a new Cursor session begins. It performs a broad project-level recall and injects relevant memories as hidden context.
+
+`retain.py` runs on `sessionEnd` as well. Without that, every conversation shorter than `retainEveryNTurns` is lost outright: at the default of 10, a seven-turn chat fires `stop` seven times, the turn gate rejects all seven, and the session is never stored. `sessionEnd` bypasses the turn window so the tail of a session is always retained. The plugin tracks how many transcript messages it has already retained per session, so the overlap between the two events cannot double-store.
 
 The `init` command also configures Cursor's MCP support (`.cursor/mcp.json`) to connect to Hindsight's MCP endpoint, giving the agent explicit `recall`, `retain`, and `reflect` tools for mid-session use.
 
@@ -139,7 +145,6 @@ All settings live in `~/.hindsight/cursor.json`. Every setting can also be overr
 | `hindsightApiUrl` | `HINDSIGHT_API_URL` | `""` (empty) | URL of an external Hindsight API server. When empty, the plugin uses a local daemon instead. |
 | `hindsightApiToken` | `HINDSIGHT_API_TOKEN` | `null` | Authentication token for the external API. Only needed when `hindsightApiUrl` is set. |
 | `apiPort` | `HINDSIGHT_API_PORT` | `9077` | Port used by the local `hindsight-embed` daemon. |
-| `daemonIdleTimeout` | `HINDSIGHT_DAEMON_IDLE_TIMEOUT` | `300` | Seconds of inactivity before the local daemon shuts itself down. `0` means never. |
 | `embedVersion` | `HINDSIGHT_EMBED_VERSION` | `"latest"` | Which version of `hindsight-embed` to install via `uvx`. |
 | `embedPackagePath` | `HINDSIGHT_EMBED_PACKAGE_PATH` | `null` | Local path to a `hindsight-embed` checkout for development. |
 

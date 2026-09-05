@@ -30,8 +30,9 @@ import pytest
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.llm_wrapper import LLMConfig
 from hindsight_api.engine.maintenance import MaintenanceLoop
-from hindsight_api.engine.response_models import ReflectResult
+from hindsight_api.engine.response_models import LLMCallResult, ReflectResult, TokenUsage
 from hindsight_api.engine.retain import embedding_utils
+from tests.conftest import stub_refresh_has_sources
 
 
 def _canned_reflect_result(text: str, facts: list[dict] | None = None) -> ReflectResult:
@@ -71,6 +72,7 @@ def patch_reflect(monkeypatch):
             return result
 
         monkeypatch.setattr(memory, "reflect_async", fake_reflect_async)
+        stub_refresh_has_sources(monkeypatch, memory)
         return calls
 
     return _install
@@ -112,7 +114,7 @@ def patch_llm_call(monkeypatch):
 
         async def fake_call(*, messages, **kwargs):
             calls.append({"messages": messages, **kwargs})
-            return canned
+            return LLMCallResult(content=canned, usage=TokenUsage())
 
         monkeypatch.setattr(memory._reflect_llm_config, "call", fake_call)
         return calls
@@ -155,6 +157,7 @@ async def _seed_fact_row(memory: MemoryEngine, bank_id: str, text: str) -> str:
                     occurred_start=None,
                     occurred_end=None,
                     mentioned_at=None,
+                    attachment_ids=[],
                 )
             ],
             document_id=None,
@@ -950,6 +953,62 @@ class TestDeltaRefreshPlumbing:
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
+    async def test_delta_call_sends_the_operation_schema(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+    ):
+        """The delta call asks for structured output, like retain's extraction (#3901).
+
+        It used to be a bare text call: the operation schema is a discriminated
+        union, which no provider would accept as ``oneOf`` + ``discriminator``, so
+        the prompt was the only thing describing the payload and a model that
+        spelled a block differently cost a whole refresh. The union is now sent as
+        ``anyOf``, so the schema travels with the request.
+
+        ``skip_validation`` must stay on: the raw JSON goes to
+        ``parse_delta_operation_list``, which drops a single malformed op instead
+        of failing the batch the way ``model_validate`` would.
+        """
+        from hindsight_api.config import get_config
+        from hindsight_api.engine.reflect.delta_ops import DeltaOperationList
+
+        bank_id = f"test-delta-schema-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content="# Team\n\nAlice is the lead.\n",
+            trigger={"mode": "delta"},
+            request_context=request_context,
+        )
+
+        # First refresh runs in full mode and seeds the tracking column; only the
+        # second one takes the delta path whose call shape this test is about.
+        patch_reflect(memory, text="ignored — full mode candidate")
+        patch_llm_call(memory, returns=[])
+        await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+
+        patch_reflect(
+            memory,
+            text="# Team\n\nAlice is the lead. Bob joined.",
+            facts=[{"id": "obs-bob", "text": "Bob joined the team", "type": "observation", "context": None}],
+        )
+        llm_calls = patch_llm_call(memory, returns=[])
+        await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+
+        assert llm_calls, "the structured-delta call must fire"
+        call = llm_calls[-1]
+        assert call["response_format"] is DeltaOperationList
+        assert call["skip_validation"] is True
+        assert call["strict_schema"] == get_config().llm_strict_schema_reflect
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
     async def test_delta_call_is_traced_and_uses_decoupled_completion_cap(
         self,
         memory: MemoryEngine,
@@ -1003,7 +1062,7 @@ class TestDeltaRefreshPlumbing:
             captured["trace_operation"] = ctx.operation if ctx else None
             captured["trace_bank_id"] = ctx.bank_id if ctx else None
             captured["trace_metadata"] = dict(ctx.metadata) if ctx else None
-            return DeltaOperationList()
+            return LLMCallResult(content=DeltaOperationList(), usage=TokenUsage())
 
         # First (seeding) refresh — value captured here is overwritten by the second.
         monkeypatch.setattr(memory._reflect_llm_config, "call", capturing_call)
@@ -1209,7 +1268,7 @@ class TestDeltaRefreshPlumbing:
         async def ok_call(*, messages, **kwargs):
             from hindsight_api.engine.reflect.delta_ops import DeltaOperationList
 
-            return DeltaOperationList()
+            return LLMCallResult(content=DeltaOperationList(), usage=TokenUsage())
 
         monkeypatch.setattr(memory._reflect_llm_config, "call", ok_call)
         seeded = await memory.refresh_mental_model(

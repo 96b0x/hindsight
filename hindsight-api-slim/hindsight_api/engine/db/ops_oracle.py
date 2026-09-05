@@ -11,12 +11,14 @@ from datetime import UTC, datetime
 
 from .base import DatabaseConnection
 from .ops import (
+    ClaimedOperations,
     DataAccessOps,
     LinkExpansionRows,
     TagListingParts,
     UpdatedWindow,
     bank_serialization_sql,
     document_serialization_sql,
+    memory_unit_columns,
 )
 from .result import DictResultRow as ResultRow
 
@@ -103,6 +105,7 @@ class OracleOps(DataAccessOps):
         tags_list: list[str],
         observation_scopes_list: list,
         text_signals_list: list,
+        attachment_ids_list: list,
         text_search_extension: str = "native",
     ) -> list[str]:
         table = self._get_mu_table()
@@ -130,14 +133,19 @@ class OracleOps(DataAccessOps):
                     tags_value,
                     observation_scopes_list[i],
                     text_signals_list[i],
+                    # Already a JSON string from the writes layer (the same
+                    # convention `tags_list` uses), and the column's IS JSON
+                    # check wants exactly that — pass it through rather than
+                    # encoding it twice.
+                    attachment_ids_list[i] or "[]",
                 )
             )
         await conn.executemany(
             f"""
             INSERT INTO {table} (id, bank_id, text, embedding, event_date, occurred_start,
                 occurred_end, mentioned_at, context, fact_type, metadata, chunk_id, document_id,
-                tags, observation_scopes, text_signals)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                tags, observation_scopes, text_signals, attachment_ids)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             """,
             rows_data,
         )
@@ -603,9 +611,7 @@ class OracleOps(DataAccessOps):
                 GROUP BY t.unit_id
             ),
             entity_expanded AS (
-                SELECT mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start,
-                       mu.occurred_end, mu.mentioned_at,
-                       mu.fact_type, mu.document_id, mu.chunk_id, mu.tags, mu.proof_count,
+                SELECT {memory_unit_columns("mu", indent=23)},
                        es.score, 'entity' AS source
                 FROM entity_scores es
                 JOIN {mu_table} mu ON mu.id = es.unit_id
@@ -646,9 +652,7 @@ class OracleOps(DataAccessOps):
                 GROUP BY id
             ),
             semantic_expanded AS (
-                SELECT mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start,
-                       mu.occurred_end, mu.mentioned_at,
-                       mu.fact_type, mu.document_id, mu.chunk_id, mu.tags, mu.proof_count,
+                SELECT {memory_unit_columns("mu", indent=23)},
                        ss.score, 'semantic' AS source
                 FROM sem_scores ss
                 JOIN {mu_table} mu ON mu.id = ss.id
@@ -657,9 +661,7 @@ class OracleOps(DataAccessOps):
             ),
             causal_ranked AS (
                 SELECT
-                    mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start,
-                    mu.occurred_end, mu.mentioned_at,
-                    mu.fact_type, mu.document_id, mu.chunk_id, mu.tags, mu.proof_count,
+                    {memory_unit_columns("mu", indent=20)},
                     ml.weight AS score,
                     'causal' AS source,
                     ROW_NUMBER() OVER (PARTITION BY mu.id ORDER BY ml.weight DESC) AS rn_
@@ -671,8 +673,8 @@ class OracleOps(DataAccessOps):
                   {window.clause("mu")}
             ),
             causal_expanded AS (
-                SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at,
-                       fact_type, document_id, chunk_id, tags, proof_count, score, source
+                SELECT {memory_unit_columns(indent=23)},
+                       score, source
                 FROM causal_ranked WHERE rn_ = 1
                 ORDER BY score DESC
                 FETCH FIRST $3 ROWS ONLY
@@ -697,6 +699,14 @@ class OracleOps(DataAccessOps):
         # Previously used JSON_TABLE to explode source_memory_ids CLOB. The junction
         # table approach uses standard SQL joins, identical to the PG backend.
         #
+        # Entity/source traversal and semantic/causal expansion run as ONE query
+        # (#3857): the observation entity arm is fused into the semantic/causal CTE
+        # query behind an 'entity' source discriminator, like the non-observation
+        # combined expansion, so a normal call performs one fetch instead of two.
+        # Every predicate, score expression, ordering, limit, and the window bind
+        # positions are exactly the two previous statements', now sharing one
+        # snapshot. The caller splits the unioned rows by `source`.
+        #
         # Two PostgreSQL fixes are deliberately NOT mirrored here, because neither
         # was measured against Oracle and both are tuned to PostgreSQL's planner:
         #   - #3085 made PG score set-wise; the scoring below is still the
@@ -714,7 +724,7 @@ class OracleOps(DataAccessOps):
         from ..schema import fq_table
 
         obs_sources_table = fq_table("observation_sources")
-        entity_rows = await conn.fetch(
+        all_rows = await conn.fetch(
             f"""
             WITH seed_sources AS (
                 SELECT DISTINCT os.source_id
@@ -739,39 +749,29 @@ class OracleOps(DataAccessOps):
                 WHERE NOT EXISTS (
                     SELECT 1 FROM seed_sources ss WHERE ss.source_id = t.unit_id
                 )
-            )
-            SELECT
-                mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start,
-                mu.occurred_end, mu.mentioned_at,
-                mu.fact_type, mu.document_id, mu.chunk_id, mu.tags, mu.proof_count,
-                (SELECT COUNT(*)
-                 FROM {obs_sources_table} os2
-                 WHERE os2.observation_id = mu.id
-                   AND os2.source_id IN (SELECT source_id FROM connected_sources)
-                ) AS score
-            FROM {mu_table} mu
-            WHERE mu.fact_type = 'observation'
-              AND mu.id != ALL($1::uuid[])
-              AND EXISTS (
-                  SELECT 1 FROM {obs_sources_table} os3
-                  WHERE os3.observation_id = mu.id
-                    AND os3.source_id IN (SELECT source_id FROM connected_sources)
-              )
-              {window.clause("mu")}
-            ORDER BY score DESC
-            FETCH FIRST $2 ROWS ONLY
-            """,
-            seed_ids,
-            budget,
-            *window.params,
-        )
-        logger.debug(f"[LinkExpansion] observation graph (Oracle): found {len(entity_rows)} connected observations")
-
-        # Semantic + causal for observations (Oracle path)
-        # Avoids GROUP BY CLOB and DISTINCT ON — mirrors _expand_world_facts Oracle strategy.
-        sem_causal_rows = await conn.fetch(
-            f"""
-            WITH sem_scores AS (
+            ),
+            observation_entity_expanded AS (
+                SELECT
+                    {memory_unit_columns("mu", indent=20)},
+                    (SELECT COUNT(*)
+                     FROM {obs_sources_table} os2
+                     WHERE os2.observation_id = mu.id
+                       AND os2.source_id IN (SELECT source_id FROM connected_sources)
+                    ) AS score,
+                    'entity' AS source
+                FROM {mu_table} mu
+                WHERE mu.fact_type = 'observation'
+                  AND mu.id != ALL($1::uuid[])
+                  AND EXISTS (
+                      SELECT 1 FROM {obs_sources_table} os3
+                      WHERE os3.observation_id = mu.id
+                        AND os3.source_id IN (SELECT source_id FROM connected_sources)
+                  )
+                  {window.clause("mu")}
+                ORDER BY score DESC
+                FETCH FIRST $2 ROWS ONLY
+            ),
+            sem_scores AS (
                 SELECT id, MAX(weight) AS score
                 FROM (
                     SELECT mu.id, ml.weight
@@ -791,9 +791,7 @@ class OracleOps(DataAccessOps):
                 GROUP BY id
             ),
             semantic_expanded AS (
-                SELECT mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start,
-                       mu.occurred_end, mu.mentioned_at,
-                       mu.fact_type, mu.document_id, mu.chunk_id, mu.tags, mu.proof_count,
+                SELECT {memory_unit_columns("mu", indent=23)},
                        ss.score, 'semantic' AS source
                 FROM sem_scores ss
                 JOIN {mu_table} mu ON mu.id = ss.id
@@ -802,9 +800,8 @@ class OracleOps(DataAccessOps):
             ),
             causal_ranked AS (
                 SELECT
-                    mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start,
-                    mu.occurred_end, mu.mentioned_at, mu.fact_type, mu.document_id,
-                    mu.chunk_id, mu.tags, mu.proof_count, ml.weight AS score,
+                    {memory_unit_columns("mu", indent=20)},
+                    ml.weight AS score,
                     'causal' AS source,
                     ROW_NUMBER() OVER (PARTITION BY mu.id ORDER BY ml.weight DESC) AS rn_
                 FROM {ml_table} ml
@@ -815,12 +812,14 @@ class OracleOps(DataAccessOps):
                   {window.clause("mu")}
             ),
             causal_expanded AS (
-                SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at,
-                       fact_type, document_id, chunk_id, tags, proof_count, score, source
+                SELECT {memory_unit_columns(indent=23)},
+                       score, source
                 FROM causal_ranked WHERE rn_ = 1
                 ORDER BY score DESC
                 FETCH FIRST $2 ROWS ONLY
             )
+            SELECT * FROM observation_entity_expanded
+            UNION ALL
             SELECT * FROM semantic_expanded
             UNION ALL
             SELECT * FROM causal_expanded
@@ -829,10 +828,11 @@ class OracleOps(DataAccessOps):
             budget,
             *window.params,
         )
-
-        semantic_rows = [r for r in sem_causal_rows if r["source"] == "semantic"]
-        causal_rows = [r for r in sem_causal_rows if r["source"] == "causal"]
-        return LinkExpansionRows(entity=list(entity_rows), semantic=semantic_rows, causal=causal_rows)
+        entity_rows = [r for r in all_rows if r["source"] == "entity"]
+        logger.debug(f"[LinkExpansion] observation graph (Oracle): found {len(entity_rows)} connected observations")
+        semantic_rows = [r for r in all_rows if r["source"] == "semantic"]
+        causal_rows = [r for r in all_rows if r["source"] == "causal"]
+        return LinkExpansionRows(entity=entity_rows, semantic=semantic_rows, causal=causal_rows)
 
     def build_tag_listing_parts(self, mu_table: str) -> TagListingParts:
         return TagListingParts(
@@ -910,17 +910,24 @@ class OracleOps(DataAccessOps):
             http_config_json,
         )
 
-    async def list_webhooks_for_bank(self, conn, table, bank_id):
+    async def list_webhooks_for_bank(self, conn, table, bank_id, limit, offset):
         return await conn.fetch(
             f"""
             SELECT id, bank_id, url, secret, event_types, enabled,
                    http_config::text, created_at::text, updated_at::text
             FROM {table}
             WHERE bank_id = $1
-            ORDER BY created_at
+            ORDER BY created_at, id
+            LIMIT $2 OFFSET $3
             """,
             bank_id,
+            limit,
+            offset,
         )
+
+    async def count_webhooks_for_bank(self, conn, table, bank_id):
+        row = await conn.fetchrow(f"SELECT COUNT(*) AS total FROM {table} WHERE bank_id = $1", bank_id)
+        return int(row["total"]) if row else 0
 
     async def get_webhooks_for_dispatch(self, conn, webhook_table, bank_id):
         return await conn.fetch(
@@ -1349,6 +1356,81 @@ class OracleOps(DataAccessOps):
             *params,
         )
 
+    async def _claim_reserved_tasks(self, conn, table, limit, op_type) -> list:
+        """Claim rows of one operation type against that type's reserved pool."""
+        return await conn.fetch(
+            f"""
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            FROM {table} o
+            WHERE o.status = 'pending'
+              AND o.task_payload IS NOT NULL
+              AND o.operation_type = $1
+              AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
+              AND {bank_serialization_sql(table, "o")}
+              AND {document_serialization_sql(table, "o")}
+            ORDER BY o.created_at
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+            """,
+            op_type,
+            limit,
+        )
+
+    async def _claim_shared_tasks(self, conn, table, claimed_ids, limit) -> list:
+        """Claim the shared pool oldest-first.
+
+        No bank rotation, unlike PostgreSQL (#3861). Two things rule the
+        rotation query out here rather than it being an oversight:
+
+        * Oracle rejects ``FETCH FIRST`` with ``FOR UPDATE`` (ORA-02014), so
+          ``db/oracle.py`` rewrites a limited claim into ``WHERE ROWNUM <= n``.
+          Oracle applies ``ROWNUM`` *before* ``ORDER BY``, so an ordered claim
+          returns an arbitrary n rows — a rotation ordered by ``bank_id`` would
+          land on whichever bank happens to be scanned first, which under bulk
+          ingest is overwhelmingly the bank the rotation exists to rotate away
+          from.
+        * That rewrite injects into the first ``WHERE`` it finds, which in a
+          CTE-based claim is the rotation branch, not the outer query.
+
+        Fixing that means reworking the ROWNUM rewrite, which the existing
+        ``created_at`` claim depends on just as much.
+        """
+        if claimed_ids:
+            return await conn.fetch(
+                f"""
+                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+                FROM {table} o
+                WHERE o.status = 'pending'
+                  AND o.task_payload IS NOT NULL
+                  AND o.operation_type != 'consolidation'
+                  AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
+                  AND o.operation_id != ALL($1::uuid[])
+                  AND {bank_serialization_sql(table, "o")}
+                  AND {document_serialization_sql(table, "o")}
+                ORDER BY o.created_at
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+                """,
+                claimed_ids,
+                limit,
+            )
+        return await conn.fetch(
+            f"""
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            FROM {table} o
+            WHERE o.status = 'pending'
+              AND o.task_payload IS NOT NULL
+              AND o.operation_type != 'consolidation'
+              AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
+              AND {bank_serialization_sql(table, "o")}
+              AND {document_serialization_sql(table, "o")}
+            ORDER BY o.created_at
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            """,
+            limit,
+        )
+
     async def claim_tasks(
         self,
         conn,
@@ -1357,10 +1439,18 @@ class OracleOps(DataAccessOps):
         reserved_limits,
         shared_limit,
         *,
+        bank_cursor="",
         consolidation_bank_priority=None,
     ):
         all_rows = []
         claimed_ids = []
+
+        def _collect(rows) -> int:
+            """Record a claim query's rows, and report how many it returned."""
+            for row in rows:
+                claimed_ids.append(row["operation_id"])
+                all_rows.append(row)
+            return len(rows)
 
         # --- Phase 1: claim from reserved pools ---
         for op_type, limit in reserved_limits.items():
@@ -1368,35 +1458,17 @@ class OracleOps(DataAccessOps):
                 continue
 
             if op_type == "consolidation":
-                rows = await self._claim_consolidation_tasks(
-                    conn,
-                    table,
-                    claimed_ids,
-                    limit,
-                    consolidation_bank_priority,
+                _collect(
+                    await self._claim_consolidation_tasks(
+                        conn,
+                        table,
+                        claimed_ids,
+                        limit,
+                        consolidation_bank_priority,
+                    )
                 )
             else:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
-                    FROM {table} o
-                    WHERE o.status = 'pending'
-                      AND o.task_payload IS NOT NULL
-                      AND o.operation_type = $1
-                      AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
-                      AND {bank_serialization_sql(table, "o")}
-                      AND {document_serialization_sql(table, "o")}
-                    ORDER BY o.created_at
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    op_type,
-                    limit,
-                )
-
-            for row in rows:
-                claimed_ids.append(row["operation_id"])
-                all_rows.append(row)
+                _collect(await self._claim_reserved_tasks(conn, table, limit, op_type))
 
         # --- Phase 2: claim from shared pool ---
         remaining_shared = shared_limit
@@ -1404,70 +1476,28 @@ class OracleOps(DataAccessOps):
             # 2a. Non-consolidation tasks. graph_maintenance stays in this
             # created_at-ordered query — see bank_serialization_sql
             # for why it is a predicate rather than a phase of its own.
-            if claimed_ids:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
-                    FROM {table} o
-                    WHERE o.status = 'pending'
-                      AND o.task_payload IS NOT NULL
-                      AND o.operation_type != 'consolidation'
-                      AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
-                      AND o.operation_id != ALL($1::uuid[])
-                      AND {bank_serialization_sql(table, "o")}
-                      AND {document_serialization_sql(table, "o")}
-                    ORDER BY o.created_at
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    claimed_ids,
-                    remaining_shared,
-                )
-            else:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
-                    FROM {table} o
-                    WHERE o.status = 'pending'
-                      AND o.task_payload IS NOT NULL
-                      AND o.operation_type != 'consolidation'
-                      AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
-                      AND {bank_serialization_sql(table, "o")}
-                      AND {document_serialization_sql(table, "o")}
-                    ORDER BY o.created_at
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    remaining_shared,
-                )
-
-            for row in rows:
-                claimed_ids.append(row["operation_id"])
-                all_rows.append(row)
-            remaining_shared -= len(rows)
+            remaining_shared -= _collect(await self._claim_shared_tasks(conn, table, claimed_ids, remaining_shared))
 
             # 2b. Consolidation tasks (with bank-serialization + optional priority)
             if remaining_shared > 0:
-                rows = await self._claim_consolidation_tasks(
-                    conn,
-                    table,
-                    claimed_ids,
-                    remaining_shared,
-                    consolidation_bank_priority,
+                _collect(
+                    await self._claim_consolidation_tasks(
+                        conn,
+                        table,
+                        claimed_ids,
+                        remaining_shared,
+                        consolidation_bank_priority,
+                    )
                 )
 
-                for row in rows:
-                    claimed_ids.append(row["operation_id"])
-                    all_rows.append(row)
-
         if not all_rows:
-            return []
+            return ClaimedOperations(rows=[], next_bank_cursor=bank_cursor)
 
         # Mark all claimed rows as processing
         operation_ids = [row["operation_id"] for row in all_rows]
         await self.mark_operations_processing(conn, table, worker_id, operation_ids)
 
-        return all_rows
+        return ClaimedOperations(rows=all_rows, next_bank_cursor=bank_cursor)
 
     async def mark_operations_processing(
         self,

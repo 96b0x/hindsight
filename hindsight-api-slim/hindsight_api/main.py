@@ -25,8 +25,10 @@ from . import __version__
 from .banner import print_banner
 from .config import (
     DEFAULT_ACCESS_LOG,
+    DEFAULT_EVENT_LOOPS,
     DEFAULT_WORKERS,
     ENV_ACCESS_LOG,
+    ENV_EVENT_LOOPS,
     ENV_HOST,
     ENV_WORKERS,
     HindsightConfig,
@@ -35,9 +37,7 @@ from .config import (
 )
 from .daemon import (
     DEFAULT_DAEMON_PORT,
-    DEFAULT_IDLE_TIMEOUT,
     ENV_DAEMON_CHILD,
-    IdleTimeoutMiddleware,
     daemonize,
 )
 
@@ -177,6 +177,17 @@ def _parse_cli_args(argv: list[str], config: HindsightConfig) -> ParsedCliArgs:
         default=int(os.getenv(ENV_WORKERS, str(DEFAULT_WORKERS))),
         help=f"Number of worker processes (env: {ENV_WORKERS}, default: {DEFAULT_WORKERS})",
     )
+    parser.add_argument(
+        "--event-loops",
+        type=int,
+        default=int(os.getenv(ENV_EVENT_LOOPS, str(DEFAULT_EVENT_LOOPS))),
+        help=(
+            "Event loops per process, each on its own thread "
+            f"(env: {ENV_EVENT_LOOPS}, default: {DEFAULT_EVENT_LOOPS}). "
+            ">1 only helps on a free-threaded build, where loops run Python in parallel; "
+            "on a GIL build they take turns and this only adds overhead."
+        ),
+    )
 
     # Access log options
     parser.add_argument(
@@ -208,13 +219,14 @@ def _parse_cli_args(argv: list[str], config: HindsightConfig) -> ParsedCliArgs:
     parser.add_argument(
         "--daemon",
         action="store_true",
-        help=f"Run as background daemon (uses port {DEFAULT_DAEMON_PORT}, auto-exits after idle)",
+        help=f"Run as background daemon (uses port {DEFAULT_DAEMON_PORT})",
     )
     parser.add_argument(
         "--idle-timeout",
         type=int,
-        default=DEFAULT_IDLE_TIMEOUT,
-        help=f"Idle timeout in seconds before auto-exit in daemon mode (default: {DEFAULT_IDLE_TIMEOUT})",
+        default=0,
+        help="Deprecated and ignored: the daemon no longer auto-exits when idle (accepted for "
+        "backward compatibility with existing launchers).",
     )
 
     args = parser.parse_args(argv)
@@ -245,9 +257,17 @@ def main():
     # is_daemon_child is True when we are the re-exec'd child spawned by
     # daemonize() or by hindsight-embed's DaemonEmbedManager.  The child
     # does not have --daemon in its argv, but must still behave as a daemon
-    # (resolve host/port, enable idle timeout, suppress banner, etc.).
+    # (resolve host/port, suppress banner, etc.).
     is_daemon_child = os.environ.get(ENV_DAEMON_CHILD) == "1"
     is_daemon = args.daemon or is_daemon_child
+
+    if args.idle_timeout:
+        # Kept parseable so older launchers (hindsight-embed, the coding-agent
+        # integrations) still start, but deliberately inert — see daemon.py.
+        print(
+            f"--idle-timeout {args.idle_timeout} is ignored: the daemon no longer auto-exits when idle.",
+            file=sys.stderr,
+        )
 
     if is_daemon:
         resolved_daemon_host_port = resolve_daemon_host_port(
@@ -326,7 +346,6 @@ def main():
     # with it, before uvicorn's child bootstrap even starts. See docs/plans/recall-latency.md.
     _memory = None
     app = None
-    idle_middleware = None
 
     if not use_import_string:
         # Create MemoryEngine (reads configuration from environment)
@@ -354,18 +373,6 @@ def main():
             initialize_memory=True,
         )
 
-        # Wrap with idle timeout middleware in daemon mode
-        if is_daemon:
-            idle_middleware = IdleTimeoutMiddleware(app, idle_timeout=args.idle_timeout)
-            app = idle_middleware
-    elif is_daemon:
-        # The idle-timeout middleware wraps an app OBJECT, and this mode serves an import string,
-        # so there is nothing to wrap. That was already true and already silent; say it out loud
-        # rather than let a daemon quietly never time out.
-        logging.warning(
-            "--daemon idle timeout is not applied with --workers > 1 or --reload: "
-            "those modes serve an import string, which the middleware cannot wrap."
-        )
     # Check for uvloop/winloop availability
     loop_impl = "asyncio"
     if sys.platform == "win32":
@@ -429,26 +436,86 @@ def main():
             text_search_extension=config.text_search_extension,
         )
 
-    # Start idle checker in daemon mode
-    if idle_middleware is not None:
-        # Start the idle checker in a background thread with its own event loop
-        import logging
-        import threading
-
-        def run_idle_checker():
-            import time
-
-            time.sleep(2)  # Wait for uvicorn to start
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(idle_middleware._check_idle())
-            except Exception as e:
-                logging.error(f"Idle checker error: {e}", exc_info=True)
-
-        threading.Thread(target=run_idle_checker, daemon=True).start()
+    if args.event_loops > 1:
+        _serve_multi_loop(args, config, uvicorn_config, operation_validator, tenant_extension)
+        return
 
     uvicorn.run(**uvicorn_config)
+
+
+def _serve_multi_loop(args, config, uvicorn_config, operation_validator, tenant_extension) -> None:
+    """Serve from several event loops in one process. See hindsight_api/multi_loop.py.
+
+    Each loop builds its OWN engine and app: uvicorn runs a lifespan per server, and an
+    asyncpg pool belongs to the loop that created it, so nothing here can be shared.
+    """
+    import logging
+
+    from . import multi_loop
+
+    _this = sys.modules[__name__]
+    MemoryEngine = _this.MemoryEngine
+    create_app = _this.create_app
+    DefaultExtensionContext = _this.DefaultExtensionContext
+
+    if args.event_loops > 1 and not multi_loop.is_free_threaded():
+        logging.warning(
+            "--event-loops=%d on a GIL build: the loops will take turns rather than run in "
+            "parallel, so this adds thread and connection overhead for no throughput. It is "
+            "only a win on a free-threaded interpreter (the -py3.14t image).",
+            args.event_loops,
+        )
+
+    # The configured pool size describes a PROCESS, so it is divided rather than
+    # multiplied — N loops each opening the full pool exhausts max_connections.
+    pool_max = multi_loop.divide_pool_budget(config.db_pool_max_size, args.event_loops)
+    pool_min = max(1, config.db_pool_min_size // args.event_loops)
+    logging.info(
+        "Event loops: %d; per-loop DB pool min=%d max=%d (process total ~%d)",
+        args.event_loops,
+        pool_min,
+        pool_max,
+        pool_max * args.event_loops,
+    )
+
+    def build_app(*, primary: bool):
+        memory = MemoryEngine(
+            operation_validator=operation_validator,
+            tenant_extension=tenant_extension,
+            run_migrations=primary and config.run_migrations_on_startup,
+            pool_min_size=pool_min,
+            pool_max_size=pool_max,
+            run_background_tasks=primary,
+        )
+        if tenant_extension:
+            # One context per loop, holding THIS loop's engine. build_app runs on the loop's
+            # own thread, and the extension keeps the context per thread, so each loop reaches
+            # its own pool rather than whichever loop happened to be built last.
+            tenant_extension.set_context(
+                DefaultExtensionContext(
+                    database_url=config.database_url,
+                    memory_engine=memory,
+                    is_primary=primary,
+                )
+            )
+        return create_app(
+            memory=memory,
+            http_api_enabled=True,
+            mcp_api_enabled=config.mcp_enabled,
+            mcp_mount_path="/mcp",
+            initialize_memory=True,
+            run_background_tasks=primary,
+        )
+
+    # host/port move to the shared listening socket; the rest is uvicorn's.
+    server_kwargs = {k: v for k, v in uvicorn_config.items() if k not in ("app", "host", "port", "workers", "reload")}
+    multi_loop.serve(
+        build_app=build_app,
+        loops=args.event_loops,
+        host=args.host,
+        port=args.port,
+        uvicorn_kwargs=server_kwargs,
+    )
 
 
 if __name__ == "__main__":

@@ -11,14 +11,20 @@ no failure signal anywhere to alert on.
 Reflect now raises instead of inventing text, so the refresh never reaches its
 write. These tests assert that end of it: the exception propagates and the
 stored document is byte-identical afterwards.
+
+The refresh re-raises it as a ``MentalModelRefreshError`` carrying
+``failure_reason="no_answer"``, so the failure also reaches the operation's typed
+details and the model's own history rather than only a prose error_message
+(#2894); the reflect error stays as ``__cause__``.
 """
 
 import uuid
 
 import pytest
 
-from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.memory_engine import MemoryEngine, MentalModelRefreshError
 from hindsight_api.engine.reflect import ReflectNoAnswerError
+from tests.conftest import stub_refresh_has_sources
 
 EXISTING = "# Team\n\nAlice leads platform. Bob owns ingest.\n"
 
@@ -46,8 +52,9 @@ async def test_refresh_preserves_content_when_reflect_has_no_answer(memory, requ
             raise ReflectNoAnswerError("Reflect's done tool returned no answer (iteration 3, 5 tool call(s) made).")
 
         monkeypatch.setattr(memory, "reflect_async", no_answer)
+        stub_refresh_has_sources(monkeypatch, memory)
 
-        with pytest.raises(ReflectNoAnswerError):
+        with pytest.raises(MentalModelRefreshError):
             await memory.refresh_mental_model(
                 bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
             )
@@ -80,8 +87,9 @@ async def test_refresh_does_not_advance_the_watermark_on_no_answer(memory, reque
             raise ReflectNoAnswerError("Reflect's final synthesis returned no text after 4 iteration(s).")
 
         monkeypatch.setattr(memory, "reflect_async", no_answer)
+        stub_refresh_has_sources(monkeypatch, memory)
 
-        with pytest.raises(ReflectNoAnswerError):
+        with pytest.raises(MentalModelRefreshError):
             await memory.refresh_mental_model(
                 bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
             )

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
 
 from opentelemetry import trace
@@ -24,6 +25,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import Status, StatusCode
 
 if TYPE_CHECKING:
+    from opentelemetry.context import Context
+
     from .config import HindsightConfig, StaticConfigProxy
 
 logger = logging.getLogger(__name__)
@@ -299,6 +302,7 @@ def get_tracer() -> trace.Tracer | NoOpTracer:
     return _tracer
 
 
+@contextmanager
 def create_operation_span(operation: str, bank_id: str | None = None):
     """
     Create a parent span for a Hindsight operation (retain, reflect, consolidation, etc.).
@@ -315,26 +319,74 @@ def create_operation_span(operation: str, bank_id: str | None = None):
         Span context manager
     """
     if not _tracing_enabled or _tracer is None:
-        # Return a no-op context manager
-        from contextlib import nullcontext
-
-        return nullcontext()
+        yield None
+        return
 
     span_name = f"hindsight.{operation}"
-    span = _tracer.start_as_current_span(span_name)
-
-    # Add operation-specific attributes
-    if span and hasattr(span, "set_attribute"):
+    # OpenTelemetry returns a context manager here, not the span itself. Set
+    # attributes on the span yielded by that manager so exporters receive them.
+    with _tracer.start_as_current_span(span_name) as span:
         span.set_attribute("hindsight.operation", operation)
         if bank_id:
             span.set_attribute("hindsight.bank_id", bank_id)
-
-    return span
+        yield span
 
 
 def is_tracing_enabled() -> bool:
     """Check if tracing is enabled."""
     return _tracing_enabled
+
+
+# Key under which the W3C trace context travels inside a task payload. Named
+# like the other worker-only payload passengers (_tenant_id, _api_key_id).
+TASK_TRACE_CONTEXT_KEY = "_traceparent"
+
+
+def inject_task_trace_context(payload: dict[str, Any]) -> None:
+    """
+    Stamp the current trace context onto a task payload, in place.
+
+    Queued work runs in the worker process, which has no way to know which
+    request enqueued it: without this, the API's span for (say) an async retain
+    and the worker's ``hindsight.retain`` span are two unrelated traces, and the
+    API half contains nothing but the enqueue. Carrying the W3C traceparent in
+    the payload lets the worker continue the caller's trace instead.
+
+    No-op when tracing is disabled, so a payload never grows a null key.
+    """
+    if not _tracing_enabled:
+        return
+    try:
+        from opentelemetry.propagate import inject
+
+        carrier: dict[str, str] = {}
+        inject(carrier)
+        if carrier:
+            payload[TASK_TRACE_CONTEXT_KEY] = carrier
+    except Exception as e:  # tracing must never break enqueueing
+        logger.debug(f"Failed to inject trace context into task payload: {e}", exc_info=True)
+
+
+def extract_task_trace_context(payload: dict[str, Any]) -> "Context | None":
+    """
+    Rebuild the enqueueing request's trace context from a task payload.
+
+    Returns an OpenTelemetry ``Context`` to attach around task execution, or
+    None when the payload carries no trace context (an internally scheduled
+    task, or a payload queued while tracing was off).
+    """
+    if not _tracing_enabled:
+        return None
+    carrier = payload.get(TASK_TRACE_CONTEXT_KEY)
+    if not isinstance(carrier, dict):
+        return None
+    try:
+        from opentelemetry.propagate import extract
+
+        return extract(carrier)
+    except Exception as e:
+        logger.debug(f"Failed to extract trace context from task payload: {e}", exc_info=True)
+        return None
 
 
 # Maximum content length before truncation (to stay within span size limits)

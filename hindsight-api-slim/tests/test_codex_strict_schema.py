@@ -23,6 +23,7 @@ from hindsight_api.engine.providers.codex_llm import (
     _repair_invalid_json_escapes,
 )
 from hindsight_api.engine.response_models import LLMToolCall
+from tests.codex_stream_stub import stub_codex_stream
 
 
 class _Fact(BaseModel):
@@ -85,22 +86,23 @@ def test_repair_handles_trailing_backslash():
 @pytest.mark.asyncio
 async def test_strict_schema_uses_forced_function_tool():
     llm = build_llm()
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.raise_for_status.return_value = None
     tool_call = LLMToolCall(id="call-1", name="structured_response", arguments={"fact": "the sky is blue"})
 
-    with patch.object(llm._client, "post", new_callable=AsyncMock) as mock_post:
-        mock_post.return_value = response
+    with stub_codex_stream(llm, response) as mock_stream:
         with patch.object(llm, "_parse_sse_tool_stream", new_callable=AsyncMock) as mock_parse:
             mock_parse.return_value = (None, [tool_call])
-            result = await llm.call(
-                messages=[{"role": "user", "content": "The sky is blue"}],
-                response_format=_Fact,
-                strict_schema=True,
-                max_retries=0,
-            )
-        sent_payload = mock_post.call_args.kwargs["json"]
-        sent_headers = mock_post.call_args.kwargs["headers"]
+            result = (
+                await llm.call(
+                    messages=[{"role": "user", "content": "The sky is blue"}],
+                    response_format=_Fact,
+                    strict_schema=True,
+                    max_retries=0,
+                )
+            ).content
+        sent_payload = mock_stream.call_args.kwargs["json"]
+        sent_headers = mock_stream.call_args.kwargs["headers"]
 
     # Forced tool wired into the request payload.
     assert sent_payload["tool_choice"] == {"type": "function", "name": "structured_response"}
@@ -119,23 +121,24 @@ async def test_strict_schema_uses_forced_function_tool():
 @pytest.mark.asyncio
 async def test_strict_schema_skip_validation_returns_dict():
     llm = build_llm()
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.raise_for_status.return_value = None
     tool_call = LLMToolCall(id="c", name="structured_response", arguments={"fact": "x"})
     span_recorder = MagicMock()
 
     with patch("hindsight_api.tracing.get_span_recorder", return_value=span_recorder):
-        with patch.object(llm._client, "post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = response
+        with stub_codex_stream(llm, response) as mock_stream:
             with patch.object(llm, "_parse_sse_tool_stream", new_callable=AsyncMock) as mock_parse:
                 mock_parse.return_value = (None, [tool_call])
-                result = await llm.call(
-                    messages=[{"role": "user", "content": "hi"}],
-                    response_format=_Fact,
-                    strict_schema=True,
-                    skip_validation=True,
-                    max_retries=0,
-                )
+                result = (
+                    await llm.call(
+                        messages=[{"role": "user", "content": "hi"}],
+                        response_format=_Fact,
+                        strict_schema=True,
+                        skip_validation=True,
+                        max_retries=0,
+                    )
+                ).content
 
     assert result == {"fact": "x"}
     assert span_recorder.record_llm_call.call_args.kwargs["response_content"] == '{"fact": "x"}'
@@ -144,11 +147,10 @@ async def test_strict_schema_skip_validation_returns_dict():
 @pytest.mark.asyncio
 async def test_strict_schema_retries_when_forced_tool_missing():
     llm = build_llm()
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.raise_for_status.return_value = None
 
-    with patch.object(llm._client, "post", new_callable=AsyncMock) as mock_post:
-        mock_post.return_value = response
+    with stub_codex_stream(llm, response) as mock_stream:
         # Model returns no tool call at all — should raise after retries exhausted.
         with patch.object(llm, "_parse_sse_tool_stream", new_callable=AsyncMock) as mock_parse:
             mock_parse.return_value = ("some prose", [])
@@ -169,23 +171,24 @@ async def test_strict_schema_retries_when_forced_tool_missing():
 @pytest.mark.asyncio
 async def test_non_strict_repairs_invalid_escapes_without_retrying():
     llm = build_llm()
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.raise_for_status.return_value = None
     # Escape-heavy content the model would emit as invalid JSON.
     escape_heavy = r'{"fact": "run rig-control \d serial \s command"}'
 
-    with patch.object(llm._client, "post", new_callable=AsyncMock) as mock_post:
-        mock_post.return_value = response
+    with stub_codex_stream(llm, response) as mock_stream:
         with patch.object(llm, "_parse_sse_stream", new_callable=AsyncMock) as mock_parse:
             mock_parse.return_value = escape_heavy
-            result = await llm.call(
-                messages=[{"role": "user", "content": "coding transcript"}],
-                response_format=_Fact,
-                strict_schema=False,
-                max_retries=3,
-            )
+            result = (
+                await llm.call(
+                    messages=[{"role": "user", "content": "coding transcript"}],
+                    response_format=_Fact,
+                    strict_schema=False,
+                    max_retries=3,
+                )
+            ).content
 
     # Parsed on the first attempt (no retry storm): the SSE stream was read once.
-    assert mock_post.await_count == 1
+    assert mock_stream.call_count == 1
     assert isinstance(result, _Fact)
     assert result.fact == r"run rig-control \d serial \s command"

@@ -25,8 +25,11 @@ from hindsight_api.engine.llm_interface import (
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.structured_output import provider_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
+
+from ..response_models import LLMCallResult
 
 logger = logging.getLogger(__name__)
 
@@ -191,9 +194,8 @@ class ClaudeCodeLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> Any:
+    ) -> LLMCallResult:
         """
         Make an LLM API call with retry logic.
 
@@ -208,11 +210,8 @@ class ClaudeCodeLLM(LLMInterface):
             max_backoff: Maximum backoff time in seconds.
             skip_validation: Return raw JSON without Pydantic validation.
             strict_schema: Use strict JSON schema enforcement (not supported).
-            return_usage: If True, return tuple (result, TokenUsage) instead of just result.
 
         Returns:
-            If return_usage=False: Parsed response if response_format is provided, otherwise text content.
-            If return_usage=True: Tuple of (result, TokenUsage) with estimated token counts.
 
         Raises:
             OutputTooLongError: If output exceeds token limits (not supported by Claude Agent SDK).
@@ -247,7 +246,7 @@ class ClaudeCodeLLM(LLMInterface):
 
         # Add JSON schema instruction if response_format is provided
         if response_format is not None and hasattr(response_format, "model_json_schema"):
-            schema = response_format.model_json_schema()
+            schema = provider_json_schema(response_format)
             schema_instruction = (
                 f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2, ensure_ascii=False)}\n\n"
                 "Respond with ONLY the JSON, no markdown formatting."
@@ -383,15 +382,12 @@ class ClaudeCodeLLM(LLMInterface):
                         f"slow llm call: scope={scope}, model={self.provider}/{self.model}, time={duration:.3f}s"
                     )
 
-                if return_usage:
-                    token_usage = TokenUsage(
-                        input_tokens=estimated_input,
-                        output_tokens=estimated_output,
-                        total_tokens=estimated_input + estimated_output,
-                    )
-                    return result, token_usage
-
-                return result
+                token_usage = TokenUsage(
+                    input_tokens=estimated_input,
+                    output_tokens=estimated_output,
+                    total_tokens=estimated_input + estimated_output,
+                )
+                return LLMCallResult(content=result, usage=token_usage)
 
             except ValidationError:
                 # Pydantic schema validation failure — retrying with the same

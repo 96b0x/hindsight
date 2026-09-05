@@ -52,6 +52,7 @@ from hindsight_api.engine.llm_interface import (
     OutputTooLongError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_transport_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 
 # Provider-agnostic pure helpers (text cleanup, quota-defer parsing, json-mode
@@ -63,9 +64,11 @@ from hindsight_api.engine.providers.openai_compatible_llm import (
     _strip_reasoning_tags,
 )
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
-from hindsight_api.engine.structured_output import strict_json_schema
+from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
+
+from ..response_models import LLMCallResult
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +228,8 @@ class OpenAIResponsesLLM(LLMInterface):
             else:
                 client_kwargs["base_url"] = self.base_url
         if self.timeout:
-            client_kwargs["timeout"] = self.timeout
+            # Per-phase so the connect leg is capped independently (issue #3881).
+            client_kwargs["timeout"] = build_sdk_timeout(self.timeout)
 
         self._client = AsyncOpenAI(**client_kwargs)
         logger.info(
@@ -237,6 +241,10 @@ class OpenAIResponsesLLM(LLMInterface):
         """Whether the model is an OpenAI reasoning model (gpt-5.x, o1, o3)."""
         model_lower = self.model.lower()
         return any(x in model_lower for x in ["gpt-5", "o1", "o3"])
+
+    def supports_vision(self) -> bool:
+        """OpenAI's own Responses API — every model it serves reads images."""
+        return True
 
     async def verify_connection(self) -> None:
         """Verify configuration with a minimal Responses call."""
@@ -387,7 +395,7 @@ class OpenAIResponsesLLM(LLMInterface):
                 )
                 logger.warning(
                     f"APIConnectionError ({self.provider}/{self.model}, scope={scope}, HTTP {status_code}, "
-                    f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]}"
+                    f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]} [{describe_transport_error(e)}]"
                 )
                 if attempt < max_retries:
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
@@ -436,10 +444,8 @@ class OpenAIResponsesLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
-        cached_prefix: str | None = None,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> Any:
+    ) -> LLMCallResult:
         """Make a Responses API call with retry logic (see ``LLMInterface.call``)."""
         start_time = time.time()
         is_reasoning_model = self._supports_reasoning_model()
@@ -477,7 +483,7 @@ class OpenAIResponsesLLM(LLMInterface):
                     }
                 }
             else:
-                schema = response_format.model_json_schema()
+                schema = provider_json_schema(response_format)
                 params["input"] = _ensure_json_word_in_user_message(_inject_schema_into_input(input_items, schema))
                 params["text"] = {"format": {"type": "json_object"}}
 
@@ -508,7 +514,7 @@ class OpenAIResponsesLLM(LLMInterface):
                     f"slow llm call: scope={scope}, model={self.provider}/{self.model}, "
                     f"input_tokens={usage.input_tokens}, output_tokens={usage.output_tokens}, time={duration:.3f}s"
                 )
-            return (result, usage) if return_usage else result
+            return LLMCallResult(content=result, usage=usage)
 
         return await self._run_with_retries(
             params,
@@ -531,8 +537,6 @@ class OpenAIResponsesLLM(LLMInterface):
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
-        cached_prefix: str | None = None,
-        cached_prefix_message_count: int = 0,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         """Make a Responses API call with tools (see ``LLMInterface.call_with_tools``).

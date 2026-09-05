@@ -7,6 +7,8 @@ Covers:
 - HTTP API integration tests for CRUD and delivery listing endpoints
 """
 
+import hashlib
+import hmac
 import json
 import uuid
 from datetime import datetime, timezone
@@ -19,6 +21,7 @@ import pytest_asyncio
 from hindsight_api import LLMConfig
 from hindsight_api.api import create_app
 from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.extensions import OperationValidationError
 from hindsight_api.webhooks.manager import MAX_ATTEMPTS, RETRY_DELAYS, WebhookManager
 from hindsight_api.webhooks.models import (
     ConsolidationEventData,
@@ -52,15 +55,18 @@ def _make_delivery_task(
     url: str = "https://example.com/hook",
     retry_count: int = 0,
     webhook_id: str | None = None,
+    secret: str | None = None,
+    http_config: dict | None = None,
 ) -> dict:
     return {
         "type": "webhook_delivery",
         "bank_id": bank_id,
         "url": url,
-        "secret": None,
+        "secret": secret,
         "event_type": "consolidation.completed",
         "payload": '{"event":"consolidation.completed"}',
         "webhook_id": webhook_id,
+        "http_config": http_config,
         "_retry_count": retry_count,
     }
 
@@ -111,6 +117,59 @@ class TestHmacSigning:
         sig1 = manager._sign_payload("secret", b"payload-one")
         sig2 = manager._sign_payload("secret", b"payload-two")
         assert sig1 != sig2
+
+    def test_hmac_signing_matches_github_construction(self):
+        """The body-only signature is plain HMAC-SHA256 over the raw body.
+
+        This is what makes X-Hub-Signature-256 a legitimate name for it: a stock
+        GitHub-style receiver must verify it byte for byte.
+        """
+        manager = self._make_manager()
+        payload = b'{"event":"consolidation.completed"}'
+        expected = hmac.new(b"my-secret", payload, hashlib.sha256).hexdigest()
+        assert manager._sign_payload("my-secret", payload) == f"sha256={expected}"
+
+
+class TestTimestampedHmacSigning:
+    """Unit tests for WebhookManager._sign_payload_v2()."""
+
+    def _make_manager(self) -> WebhookManager:
+        pool = MagicMock()
+        return WebhookManager(backend=pool, global_webhooks=[])
+
+    def test_v2_format(self):
+        """_sign_payload_v2 returns 't=<unix>,v1=<64 hex chars>'."""
+        manager = self._make_manager()
+        sig = manager._sign_payload_v2("my-secret", b"hello world", 1772000000)
+        t_part, v1_part = sig.split(",")
+        assert t_part == "t=1772000000"
+        assert v1_part.startswith("v1=")
+        hex_part = v1_part[len("v1=") :]
+        assert len(hex_part) == 64
+        assert all(c in "0123456789abcdef" for c in hex_part)
+
+    def test_v2_signs_timestamp_dot_body(self):
+        """The MAC covers '<timestamp>.<raw body>', so the timestamp is authenticated."""
+        manager = self._make_manager()
+        payload = b'{"event":"consolidation.completed"}'
+        expected = hmac.new(b"secret", b"1772000000." + payload, hashlib.sha256).hexdigest()
+        assert manager._sign_payload_v2("secret", payload, 1772000000) == f"t=1772000000,v1={expected}"
+
+    def test_v2_differs_with_timestamp(self):
+        """A replayed body with a fresh timestamp cannot reuse the old MAC."""
+        manager = self._make_manager()
+        payload = b"payload"
+        sig1 = manager._sign_payload_v2("secret", payload, 1772000000)
+        sig2 = manager._sign_payload_v2("secret", payload, 1772000060)
+        assert sig1 != sig2
+
+    def test_v2_differs_from_body_only_signature(self):
+        """The two schemes must not collide - a body-only MAC is not a valid v2 MAC."""
+        manager = self._make_manager()
+        payload = b"payload"
+        body_only = manager._sign_payload("secret", payload)[len("sha256=") :]
+        v2 = manager._sign_payload_v2("secret", payload, 1772000000).split("v1=")[1]
+        assert body_only != v2
 
 
 class TestRetryConstants:
@@ -407,6 +466,83 @@ class TestHandleWebhookDelivery:
             # Should not raise
             await memory._handle_webhook_delivery(task_dict)
 
+    @staticmethod
+    async def _capture_headers(memory: MemoryEngine, task_dict: dict) -> dict[str, str]:
+        """Run one delivery against a stubbed transport and return the sent headers."""
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        post = AsyncMock(return_value=mock_response)
+        with patch.object(memory._http_client, "post", new=post):
+            await memory._handle_webhook_delivery(task_dict)
+        return post.call_args.kwargs["headers"]
+
+    @pytest.mark.asyncio
+    async def test_unsigned_delivery_sends_no_signature_headers(self, memory: MemoryEngine):
+        """Without a secret there is nothing to sign, so no signature header is sent."""
+        headers = await self._capture_headers(memory, _make_delivery_task(secret=None))
+
+        assert "X-Hindsight-Signature" not in headers
+        assert "X-Hub-Signature-256" not in headers
+        assert "X-Hindsight-Signature-V2" not in headers
+
+    @pytest.mark.asyncio
+    async def test_signed_delivery_emits_both_body_only_signature_headers(self, memory: MemoryEngine):
+        """X-Hub-Signature-256 carries the same value as X-Hindsight-Signature.
+
+        Same secret, same algorithm, same bytes: the second name exists only so stock
+        GitHub-style receivers can verify without a Hindsight-specific shim.
+        """
+        task_dict = _make_delivery_task(secret="my-secret")
+        headers = await self._capture_headers(memory, task_dict)
+
+        payload_bytes = task_dict["payload"].encode()
+        expected = "sha256=" + hmac.new(b"my-secret", payload_bytes, hashlib.sha256).hexdigest()
+        assert headers["X-Hindsight-Signature"] == expected
+        assert headers["X-Hub-Signature-256"] == expected
+
+    @pytest.mark.asyncio
+    async def test_signed_delivery_emits_verifiable_timestamped_signature(self, memory: MemoryEngine):
+        """X-Hindsight-Signature-V2 verifies against '<t>.<body>' with a fresh timestamp."""
+        task_dict = _make_delivery_task(secret="my-secret")
+        before = int(datetime.now(timezone.utc).timestamp())
+        headers = await self._capture_headers(memory, task_dict)
+        after = int(datetime.now(timezone.utc).timestamp())
+
+        t_part, v1_part = headers["X-Hindsight-Signature-V2"].split(",")
+        timestamp = int(t_part[len("t=") :])
+        assert before <= timestamp <= after, "signature timestamp must be the attempt time"
+
+        payload_bytes = task_dict["payload"].encode()
+        expected = hmac.new(b"my-secret", f"{timestamp}.".encode() + payload_bytes, hashlib.sha256).hexdigest()
+        assert v1_part == f"v1={expected}"
+
+    @pytest.mark.asyncio
+    async def test_custom_headers_cannot_override_signature_or_event(self, memory: MemoryEngine):
+        """http_config.headers must not be able to forge the event type or a signature.
+
+        The spread order in _handle_webhook_delivery is load-bearing: a receiver that
+        trusts these headers would otherwise be trusting caller-controlled values.
+        """
+        task_dict = _make_delivery_task(
+            secret="my-secret",
+            http_config={
+                "headers": {
+                    "X-Hindsight-Event": "attacker.controlled",
+                    "X-Hindsight-Signature": "sha256=forged",
+                    "X-Hub-Signature-256": "sha256=forged",
+                    "X-Hindsight-Signature-V2": "t=0,v1=forged",
+                    "X-Custom": "kept",
+                }
+            },
+        )
+        headers = await self._capture_headers(memory, task_dict)
+
+        assert headers["X-Hindsight-Event"] == "consolidation.completed"
+        assert headers["X-Hindsight-Signature"] != "sha256=forged"
+        assert headers["X-Hub-Signature-256"] != "sha256=forged"
+        assert headers["X-Hindsight-Signature-V2"] != "t=0,v1=forged"
+        assert headers["X-Custom"] == "kept", "unrelated custom headers still pass through"
+
     @pytest.mark.asyncio
     async def test_deliver_failure_raises_retry_task_at(self, memory: MemoryEngine):
         """A failed HTTP POST raises RetryTaskAt when retries remain."""
@@ -504,8 +640,88 @@ async def api_client(memory: MemoryEngine):
         yield client
 
 
+@pytest_asyncio.fixture
+async def webhook_validation_api_client():
+    """HTTP client with a mock engine for route-level validation failures."""
+    memory = MagicMock()
+    memory.audit_logger = None
+    app = create_app(memory, initialize_memory=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client, memory
+
+
 class TestWebhookHttpApi:
     """HTTP API integration tests for webhook CRUD endpoints."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "path", "json_body", "memory_method"),
+        [
+            ("POST", "/webhooks", {"url": "https://example.com/hook"}, "create_webhook"),
+            ("GET", "/webhooks", None, "list_webhooks"),
+            # Fixed uuids, not uuid.uuid4(): the value is interpolated into the
+            # parameter — and therefore into the test id — at collection time, and
+            # every xdist worker collects independently. Random ids made each
+            # worker's node-id list differ, so the shard aborted with "Different
+            # tests were collected between gw0 and gw2" whenever more than one
+            # worker picked these up. The endpoint never looks the id up (the
+            # validator rejects the call first), so any well-formed uuid does.
+            ("DELETE", "/webhooks/44499a74-6ba1-4c39-bc1e-7ee63635429d", None, "delete_webhook"),
+            ("PATCH", "/webhooks/66935c96-7b4c-417b-8c60-db8f102bafe9", {"enabled": False}, "update_webhook"),
+            ("GET", "/webhooks/75daa3bb-0cb3-4106-9bac-ac003d8f7b23/deliveries", None, "list_webhook_deliveries"),
+        ],
+    )
+    async def test_http_preserves_operation_validation_error(
+        self,
+        webhook_validation_api_client,
+        method: str,
+        path: str,
+        json_body: dict | None,
+        memory_method: str,
+    ):
+        """Webhook routes preserve validator status and reason instead of returning 500."""
+        api_client, memory = webhook_validation_api_client
+        setattr(
+            memory,
+            memory_method,
+            AsyncMock(side_effect=OperationValidationError("webhooks denied", status_code=403)),
+        )
+
+        response = await api_client.request(
+            method,
+            f"/v1/default/banks/validation-bank{path}",
+            json=json_body,
+        )
+
+        assert response.status_code == 403, response.text
+        assert response.json() == {"detail": "webhooks denied"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "path", "json_body"),
+        [
+            ("DELETE", "/webhooks/not-a-uuid", None),
+            ("PATCH", "/webhooks/not-a-uuid", {"enabled": False}),
+            ("GET", "/webhooks/not-a-uuid/deliveries", None),
+        ],
+    )
+    async def test_http_rejects_malformed_webhook_id(
+        self,
+        webhook_validation_api_client,
+        method: str,
+        path: str,
+        json_body: dict | None,
+    ):
+        """Malformed webhook IDs are client errors, not generic server failures."""
+        api_client, _ = webhook_validation_api_client
+        response = await api_client.request(
+            method,
+            f"/v1/default/banks/validation-bank{path}",
+            json=json_body,
+        )
+
+        assert response.status_code == 422, response.text
 
     @pytest.mark.asyncio
     async def test_http_create_webhook(self, api_client: httpx.AsyncClient):
@@ -572,6 +788,49 @@ class TestWebhookHttpApi:
 
         # Cleanup
         await api_client.delete(f"/v1/default/banks/{bank_id}/webhooks/{webhook_id}")
+
+    @pytest.mark.asyncio
+    async def test_http_list_webhooks_pagination(self, api_client: httpx.AsyncClient):
+        """GET /webhooks pages: each page is capped and total counts every webhook."""
+        bank_id = f"http-wh-{uuid.uuid4().hex[:8]}"
+
+        created = []
+        for i in range(3):
+            resp = await api_client.post(
+                f"/v1/default/banks/{bank_id}/webhooks",
+                json={"url": f"https://example.com/page-{i}", "event_types": ["consolidation.completed"]},
+            )
+            assert resp.status_code == 201
+            created.append(resp.json()["id"])
+
+        try:
+            first = await api_client.get(
+                f"/v1/default/banks/{bank_id}/webhooks",
+                params={"limit": 2, "offset": 0},
+            )
+            assert first.status_code == 200
+            first_data = first.json()
+            assert first_data["total"] == 3
+            assert first_data["limit"] == 2
+            assert first_data["offset"] == 0
+            assert len(first_data["items"]) == 2
+
+            second = await api_client.get(
+                f"/v1/default/banks/{bank_id}/webhooks",
+                params={"limit": 2, "offset": 2},
+            )
+            assert second.status_code == 200
+            second_data = second.json()
+            assert second_data["total"] == 3
+            assert second_data["offset"] == 2
+            assert len(second_data["items"]) == 1
+
+            # The pages are disjoint and together cover every webhook on the bank.
+            paged_ids = [item["id"] for item in first_data["items"] + second_data["items"]]
+            assert sorted(paged_ids) == sorted(created)
+        finally:
+            for webhook_id in created:
+                await api_client.delete(f"/v1/default/banks/{bank_id}/webhooks/{webhook_id}")
 
     @pytest.mark.asyncio
     async def test_http_delete_webhook(self, api_client: httpx.AsyncClient):
@@ -1276,6 +1535,16 @@ class TestRetainCompletedWebhook:
                 outbox_callback=callback,
             )
 
+            if not (split_counts and split_counts[0] > 1):
+                # A store that owns retain persistence buffers to its own session and commits once,
+                # so the engine does not sub-batch for it and there are no slices to spread a
+                # webhook across. The delivery count below is still the property under test and
+                # still asserted; what is absent is the multi-slice SHAPE this case exists to
+                # exercise, so say that rather than fail as though the webhook misfired.
+                from hindsight_api.engine.memories import get_memories
+
+                if get_memories().store_owned:
+                    pytest.skip("the memories store does not sub-batch; no slices to fire across")
             assert split_counts and split_counts[0] > 1, (
                 f"the batch never split, so nothing was tested (sub-batches: {split_counts})"
             )
@@ -1331,6 +1600,16 @@ class TestRetainCompletedWebhook:
                 outbox_callback=callback,
             )
 
+            if not (split_counts and split_counts[0] > 1):
+                # A store that owns retain persistence buffers to its own session and commits once,
+                # so the engine does not sub-batch for it and there are no slices to spread a
+                # webhook across. The delivery count below is still the property under test and
+                # still asserted; what is absent is the multi-slice SHAPE this case exists to
+                # exercise, so say that rather than fail as though the webhook misfired.
+                from hindsight_api.engine.memories import get_memories
+
+                if get_memories().store_owned:
+                    pytest.skip("the memories store does not sub-batch; no slices to fire across")
             assert split_counts and split_counts[0] > 1, (
                 f"the document was never sliced, so nothing was tested (sub-batches: {split_counts})"
             )
@@ -1357,13 +1636,14 @@ class TestRetainCompletedWebhook:
         """
         from hindsight_api.engine.response_models import TokenUsage
         from hindsight_api.engine.retain import fact_extraction
+        from hindsight_api.engine.retain.types import ExtractionResult
 
         bank_id = f"wh-zerofact-{uuid.uuid4().hex[:8]}"
         webhook_id = uuid.uuid4()
         original_manager = memory._webhook_manager
 
         async def _extract_no_facts(*args, **kwargs):
-            return [], [], TokenUsage()
+            return ExtractionResult([], [], TokenUsage())
 
         try:
             memory._webhook_manager = WebhookManager(backend=memory._backend, global_webhooks=[])
@@ -1473,13 +1753,14 @@ class TestRetainCompletedWebhook:
         """
         from hindsight_api.engine.response_models import TokenUsage
         from hindsight_api.engine.retain import fact_extraction
+        from hindsight_api.engine.retain.types import ExtractionResult
 
         bank_id = f"wh-zerocount-{uuid.uuid4().hex[:8]}"
         webhook_id = uuid.uuid4()
         original_manager = memory._webhook_manager
 
         async def _extract_no_facts(*args, **kwargs):
-            return [], [], TokenUsage()
+            return ExtractionResult([], [], TokenUsage())
 
         try:
             memory._webhook_manager = WebhookManager(backend=memory._backend, global_webhooks=[])

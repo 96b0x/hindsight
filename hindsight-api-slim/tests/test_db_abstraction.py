@@ -285,7 +285,11 @@ class TestPostgreSQLDialect:
             text_search_extension="vchord",
             bm25_min_score=2.5,
         )
-        assert "> 2.5" in arm
+        # Inclusive (`>=`), matching the documented `min_scores` contract and the
+        # semantic arm's `>= min_similarity`. This was `>` until #3882: the same
+        # parameter served as both vchord's structural match gate and the caller's
+        # floor, and the gate's `>` leaked into the public contract.
+        assert ">= 2.5" in arm
 
     def test_build_bm25_arm_pg_textsearch_scores_each_row(self, d):
         arm = d.build_bm25_arm(
@@ -312,11 +316,10 @@ class TestPostgreSQLDialect:
             text_param="$4",
             text_search_extension="pgroonga",
         )
-        # pgroonga uses the &@~ operator + pgroonga_score for ranking. Escape
-        # the query parameter so literal text containing pgroonga operators is
-        # not parsed as query syntax.
-        assert "&@~ pgroonga_query_escape($4)" in arm
-        assert "&@~ $4" not in arm
+        # pgroonga uses the &@~ operator + pgroonga_score for ranking with inline
+        # pgroonga_tokenize aggregation.
+        assert "&@~ (SELECT string_agg(pgroonga_query_escape(elem->>'value'), ' OR ')" in arm
+        assert "pgroonga_tokenize($4, 'tokenizer', 'TokenBigram', 'normalizer', 'NormalizerNFKC150')" in arm
         assert "pgroonga_score(tableoid, ctid)" in arm
         assert "to_tsquery" not in arm
 
@@ -355,6 +358,26 @@ class TestPostgreSQLDialect:
         assert "'bm25' AS source" in arm
         assert "LIMIT $3" in arm
 
+    def test_build_bm25_arm_pg_search_custom_schema(self, d):
+        arm = d.build_bm25_arm(
+            table="schema.memory_units",
+            cols="id, text",
+            fact_type="world",
+            bank_id_param="$2",
+            limit_param="$3",
+            text_param="$4",
+            text_search_extension="pg_search",
+            pg_search_function_schema="pgsearch",
+        )
+        assert "pgsearch.score(id)" in arm
+        assert "id @@@ pgsearch.boolean(should =>" in arm
+        assert "pgsearch.match('text', $4)" in arm
+        assert "pgsearch.match('context', $4)" in arm
+        assert "pgsearch.match('text_signals', $4)" in arm
+        assert "pgsearch.score(id) DESC" in arm
+        assert "'bm25' AS source" in arm
+        assert "LIMIT $3" in arm
+
     def test_prepare_bm25_text_native(self, d):
         result = d.prepare_bm25_text(["hello", "world"], "hello world")
         assert result == "hello | world"
@@ -364,10 +387,11 @@ class TestPostgreSQLDialect:
         assert result == "hello world"
 
     def test_prepare_bm25_text_pgroonga(self, d):
-        # Keep the user's text unchanged here; the SQL builder escapes the bind
-        # parameter at query time before invoking pgroonga's query parser.
         result = d.prepare_bm25_text(["hello", "world"], "hello world", text_search_extension="pgroonga")
         assert result == "hello world"
+
+        result = d.prepare_bm25_text(["网关计划任务"], "网关计划任务", text_search_extension="pgroonga")
+        assert result == "网关计划任务"
 
     def test_prepare_bm25_text_pg_search(self, d):
         result = d.prepare_bm25_text(["hello", "world"], "hello world", text_search_extension="pg_search")
@@ -645,17 +669,23 @@ class TestPostgreSQLBackendUnit:
 class _RecordingConnection:
     """Captures every statement, optionally failing the first (batched) one."""
 
-    def __init__(self, fail_batched: bool = False, reject: str | None = None) -> None:
+    def __init__(
+        self,
+        fail_batched: bool = False,
+        reject: str | None = None,
+        reject_error: type[Exception] = asyncpg.exceptions.UndefinedObjectError,
+    ) -> None:
         self.calls: list[tuple[str, tuple]] = []
         self._fail_batched = fail_batched
         self._reject = reject
+        self._reject_error = reject_error
 
     async def execute(self, query: str, *args) -> None:
         self.calls.append((query, args))
         if self._fail_batched and len(self.calls) == 1:
-            raise asyncpg.exceptions.UndefinedObjectError("unrecognized configuration parameter")
+            raise self._reject_error("unrecognized configuration parameter")
         if self._reject is not None and self._reject in args:
-            raise asyncpg.exceptions.UndefinedObjectError("unrecognized configuration parameter")
+            raise self._reject_error("unrecognized configuration parameter")
 
 
 class TestApplySessionSettings:
@@ -726,6 +756,36 @@ class TestApplySessionSettings:
         _, args = conn.calls[0]
         assert "pg_trgm.similarity_threshold" not in args
         assert args == ("hnsw.ef_search", "200", "statement_timeout", "600s")
+
+    @pytest.mark.asyncio
+    async def test_invalid_name_rejection_is_remembered_like_undefined_object(self):
+        """A reserved-prefix GUC rejection (InvalidNameError) must also be permanent.
+
+        The docstring above assumes an old server answers "unrecognized configuration
+        parameter" (UndefinedObjectError, 42704). PG16 + pgvector 0.6.0 answers
+        `invalid configuration parameter name "hnsw.iterative_scan"` instead —
+        InvalidNameError (42602), because the loaded extension reserves the "hnsw."
+        prefix but predates the GUC. If only UndefinedObjectError is remembered,
+        the name never reaches the unsupported-set, ``setting_rejected_by_server``
+        keeps answering False, and retain's link probing sends the GUC via SET LOCAL
+        inside its own transaction — aborting the whole link computation on every
+        retain (observed in production on PG16 + pgvector 0.6.0, 2026-08-26).
+        """
+        conn = _RecordingConnection(
+            fail_batched=True,
+            reject="hnsw.ef_search",
+            reject_error=asyncpg.exceptions.InvalidNameError,
+        )
+        await apply_session_settings(conn, self._SETTINGS)
+
+        assert pg_backend.setting_rejected_by_server("hnsw.ef_search")
+
+        # Next acquire must not re-send the rejected name.
+        conn = _RecordingConnection()
+        await apply_session_settings(conn, self._SETTINGS)
+        assert len(conn.calls) == 1
+        _, args = conn.calls[0]
+        assert "hnsw.ef_search" not in args
 
     @pytest.mark.asyncio
     async def test_a_transient_failure_does_not_disable_a_setting(self):
@@ -915,6 +975,7 @@ class TestOracleOpsInsertFactsBatch:
             metadata_jsons=['{"key": "val"}'] * n,
             chunk_ids=[f"chunk-{i}" for i in range(n)],
             document_ids=[f"doc-{i}" for i in range(n)],
+            attachment_ids_list=["[]"] * n,
             tags_list=[f'["tag-{i}"]' for i in range(n)],
             observation_scopes_list=[None] * n,
             text_signals_list=[None] * n,
@@ -978,6 +1039,7 @@ class TestOracleOpsInsertFactsBatch:
             tags_list=['["nature", "sky"]'],
             observation_scopes_list=["global"],
             text_signals_list=["positive"],
+            attachment_ids_list=["[]"],
         )
 
         query, rows_data = mock_conn.executemany.call_args.args
@@ -1006,14 +1068,24 @@ class TestOracleOpsInsertFactsBatch:
 
     @pytest.mark.asyncio
     async def test_sql_column_count_matches_values(self, ops, mock_conn):
-        """The INSERT column list and VALUES placeholders must both have 16 entries."""
+        """Columns, placeholders and bound values must all agree.
+
+        Counted against each other rather than against a literal, because the
+        literal is what goes stale: adding a column to `memory_units` bumps all
+        three together and a hardcoded number then fails for the wrong reason,
+        telling you nothing about whether they still match.
+        """
         batch = self._make_batch(1)
         await ops.insert_facts_batch(conn=mock_conn, **batch)
 
-        query, _ = mock_conn.executemany.call_args.args
-        # Extract the column list between "(" and ")" after INSERT INTO ... (
-        # and count the $N placeholders in VALUES
-        assert query.count("$") == 16, "VALUES clause must have 16 placeholders"
+        query, rows_data = mock_conn.executemany.call_args.args
+        columns = query[query.index("(") + 1 : query.index(")")].split(",")
+        placeholders = query.count("$")
+
+        assert len(columns) == placeholders, (
+            f"INSERT names {len(columns)} columns but binds {placeholders} placeholders"
+        )
+        assert len(rows_data[0]) == placeholders, f"{placeholders} placeholders but {len(rows_data[0])} values per row"
 
     @pytest.mark.asyncio
     async def test_tags_json_decoded_to_list(self, ops, mock_conn):
@@ -1094,6 +1166,7 @@ class TestPostgreSQLSearchVector:
             tags_list=[""],
             observation_scopes_list=[None],
             text_signals_list=[None],
+            attachment_ids_list=["[]"],
         )
         with patch("hindsight_api.config.get_config", return_value=self._cfg(ext)):
             await PostgreSQLOps().insert_facts_batch(conn=conn, **batch)

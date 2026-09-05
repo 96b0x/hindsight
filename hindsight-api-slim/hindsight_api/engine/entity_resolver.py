@@ -91,7 +91,7 @@ def _trigram_set(text: str) -> set[str]:
 def _trigram_set_similarity(ta: set[str], tb: set[str]) -> float:
     """Jaccard index of two already-computed trigram sets.
 
-    Split out from ``_trigram_similarity`` so callers that compare one name against many
+    Split out from ``trigram_similarity`` so callers that compare one name against many
     (the candidate scoring loop, the O(N^2) in-batch pass) build each set once instead of
     once per comparison — the loop runs up to ``entity_resolution_max_candidates`` times per
     mention on the retain hot path (GH-3211).
@@ -101,8 +101,13 @@ def _trigram_set_similarity(ta: set[str], tb: set[str]) -> float:
     return intersection / union if union else 0.0
 
 
-def _trigram_similarity(a: str, b: str) -> float:
+def trigram_similarity(a: str, b: str) -> float:
     """pg_trgm ``similarity(a, b)`` computed in-memory — the Jaccard index of the trigram sets.
+
+    Public because two subsystems share it: entity resolution here, and fuzzy tag matching in
+    ``search.tag_resolution``. One notion of "similar name" for both, so a change to it is a
+    deliberate change to both — see ``tests/test_entity_intrabatch_clustering.py``, which pins
+    the values against Postgres.
 
     Verified byte-for-byte against Postgres pg_trgm across emoji / accent / CJK / hyphen /
     apostrophe cases (issue #3107), so the merge cutoff calibrated on pg_trgm transfers exactly.
@@ -308,7 +313,7 @@ def _canonical_cooccurrence_pairs(entity_list: list[str]) -> Iterator[tuple[str,
 
 @dataclass
 class _CooccurrencePair:
-    """A (entity_id_1, entity_id_2) pair observed in a retain batch (for post-txn flush)."""
+    """A (entity_id_1, entity_id_2) pair observed in a retain batch (for the post-commit flush)."""
 
     entity_id_1: str
     entity_id_2: str
@@ -982,7 +987,7 @@ class EntityResolver:
     def _intrabatch_canonical_map(self, entities_to_create: list[_EntityToCreate]) -> dict[str, str]:
         """Map each non-label new name (lowercased) to its cluster's canonical spelling.
 
-        Uses in-memory trigram similarity (``_trigram_similarity``, verified equal to Postgres
+        Uses in-memory trigram similarity (``trigram_similarity``, verified equal to Postgres
         pg_trgm), so it is backend-agnostic — no DB round-trip on the retain hot path, and it runs
         identically on PostgreSQL, Oracle, and the pg_trgm-absent "full" fallback. Label entities
         are excluded so distinct label values stay separate (GH-1558).
@@ -1327,7 +1332,7 @@ class EntityResolver:
                         pending.append(_EntityStat(entity_id=str(entity_id), event_date=g.event_date))
 
         # Accumulate into the resolver's pending list; the orchestrator flushes
-        # these with await entity_resolver.flush_pending_stats() after the txn.
+        # these with await entity_resolver.flush_pending_stats() after the transaction.
         key = self._task_key()
         self._pending_stats.setdefault(key, []).extend(pending)
 
@@ -1422,7 +1427,6 @@ class EntityResolver:
         unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],
         bank_id: str | None = None,
         store_write: bool = True,
-        txn=None,
     ):
         """Store-owned variant of :meth:`link_units_to_entities_batch` that touches NO
         Postgres connection.
@@ -1441,11 +1445,6 @@ class EntityResolver:
         write-then-reattach) — so the store row is already correct and a second store write would
         be redundant. Co-occurrence still runs: it references only ``entities`` and is needed by the
         entity-graph endpoint and resolution's disambiguation signal regardless of who wrote the row.
-
-        ``txn`` is the caller's write-group handle. For a store that keeps the posting on the
-        memory, this re-writes rows the same write-group just created, so it belongs to that
-        group — see :meth:`MemoriesExtension.record_unit_entities`. It is only consulted when the
-        store write actually happens: under ``store_write=False`` there is no write to enrol.
         """
         if not unit_entity_pairs:
             return
@@ -1454,9 +1453,7 @@ class EntityResolver:
             (t[0], t[1], t[2] if len(t) >= 3 else None)  # type: ignore[misc]
             for t in unit_entity_pairs
         ]
-        return await self._link_units_to_entities_batch_impl(
-            None, normalized, bank_id, store_write=store_write, txn=txn
-        )
+        return await self._link_units_to_entities_batch_impl(None, normalized, bank_id, store_write=store_write)
 
     async def _link_units_to_entities_batch_impl(
         self,
@@ -1464,7 +1461,6 @@ class EntityResolver:
         unit_entity_pairs: list[tuple[str, str, datetime | None]],
         bank_id: str | None = None,
         store_write: bool = True,
-        txn=None,
     ):
         # Sorted bulk insert to prevent deadlocks from inconsistent lock ordering
         # across concurrent transactions on the unit_entities unique index.
@@ -1488,7 +1484,6 @@ class EntityResolver:
                 bank_id=bank_id,
                 unit_ids=unit_ids,
                 entity_ids=entity_ids,
-                txn=txn,
             )
 
         # Build maps keyed by unit_id:
