@@ -1076,6 +1076,7 @@ class OpenAIEmbeddings(Embeddings):
             response = await self._loop_client().embeddings.create(
                 model=self.model,
                 input=["test"],
+                encoding_format="float",
             )
             if response.data:
                 self._dimension = len(response.data[0].embedding)
@@ -1105,6 +1106,8 @@ class OpenAIEmbeddings(Embeddings):
         request: dict[str, Any] = {
             "model": self.model,
             "input": batch,
+            # OpenRouter may return no vectors for the SDK default (base64).
+            "encoding_format": "float",
         }
         if self.dimensions is not None:
             request["dimensions"] = self.dimensions
