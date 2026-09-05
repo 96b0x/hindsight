@@ -187,7 +187,8 @@ def test_openai_encode_splits_on_configured_batch_size(monkeypatch):
 
     calls: list[int] = []
 
-    def fake_create(*, model, input):
+    def fake_create(*, model, input, encoding_format):
+        assert encoding_format == "float"
         calls.append(len(input))
         return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[0.0] * 1536) for i in range(len(input))])
 
@@ -215,7 +216,8 @@ def test_openai_encode_passes_configured_dimensions():
 
     calls: list[int | None] = []
 
-    def fake_create(*, model, input, dimensions=None):
+    def fake_create(*, model, input, dimensions=None, encoding_format=None):
+        assert encoding_format == "float"
         calls.append(dimensions)
         return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[0.0] * 384) for i in range(len(input))])
 
