@@ -265,7 +265,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
-| `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
+| `recall_max_input_chars` | `4000` | Maximum current-request plus recent-dialogue query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories: a JSON list (e.g. `["project-x", "team"]`) or comma-separated text (`"project-x, team"`) |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
@@ -274,8 +274,25 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
 | `recall_min_scores` | — | Minimum relevance per score field, as a JSON object (e.g. `{"reranker": 0.25}` or `{"semantic": 0.5}`). Applies to both auto-recall and the `hindsight_recall` tool. See the tip below. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
-| `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
+| `recall_sync` | `true` | Recall against the current request and bounded recent dialogue before answering. Set false explicitly for legacy next-turn background prefetch. |
+| `context_compiler` | `false` | Select and organize retrieved evidence through Hermes' `auxiliary.memory_context` task; retain original text and provenance, with ranked-evidence fallback on failure. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
+
+#### Custom current-turn evidence compiler
+
+This fork defaults to synchronous, current-turn recall. Enable `context_compiler` in the
+provider configuration to select retrieved evidence IDs with a side model. Configure that
+model through Hermes' `auxiliary.memory_context` settings; the plugin does not choose a
+personal model, API endpoint, or credential. The host must expose
+`agent.memory_provider.call_auxiliary_task` (provided by the matching custom Hermes fork).
+On older hosts without that helper, compilation fails open to ranked original evidence.
+
+The compiler can select or group known IDs, not rewrite facts or add model-generated
+provenance. Empty, malformed, or failed selections fall back to the retrieved evidence.
+New turns, session changes, rewinds, shutdown, and freshness deadlines fence late results.
+The host's wait budget does not cancel an underlying network request; stale results are
+discarded. Retrieval type filters, multibank priority/budgets, and external-daemon ownership
+retain the upstream behavior described below.
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >
@@ -400,12 +417,17 @@ These are used **only when there is no config file at all**. Once `hermes memory
 | `HINDSIGHT_RETAIN_CONTEXT` | Label stored with each retained conversation (`retain_context`) |
 | `HINDSIGHT_RETAIN_INDICATOR` | `false` hides the "saving to memory" status line (`retain_indicator`) |
 | `HINDSIGHT_RECALL_INDICATOR` | `false` hides the "recalled N memories" status line (`recall_indicator`) |
-| `HINDSIGHT_RECALL_SYNC` | `true` recalls against the current message before answering (`recall_sync`) |
+| `HINDSIGHT_RECALL_SYNC` | `false` opts into legacy next-turn prefetch; the custom default is current-turn synchronous recall (`recall_sync`) |
 
 ## Client Version
 
 Requires `hindsight-client >= 0.10.1` and, for `local_embedded`, `hindsight-embed >= 0.10.1`. A version below
 the floor only logs a warning; `hermes plugins update hindsight` moves the environment.
+
+This fork accepts versions below 2.0 and locks the client/embed packages to 1.0.0.
+Compatibility tests exercise the real client HTTP payloads and the embed manager's API
+surface without starting a daemon. Production server/database migration remains a separate
+deployment check.
 
 The floor is 0.10.1 rather than the 0.6.1 this plugin needs at the API level because
 `hindsight-embed` 0.10.0 breaks `local_embedded` outright: its daemon probe cleared the calling

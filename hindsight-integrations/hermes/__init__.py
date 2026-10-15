@@ -34,6 +34,15 @@ from hermes_time import now as _hermes_now
 from tools.registry import tool_error
 from utils import read_json_or_empty
 
+from .compiler import (
+    MemoryCandidate,
+    build_recall_query,
+    compile_memory_context,
+    content_text,
+    memory_candidate,
+    recent_dialogue,
+    render_ranked_memory_context,
+)
 from .embedded import (
     _RETRIABLE_CONNECTION_MARKERS,
     _build_embedded_profile_env,
@@ -434,7 +443,7 @@ def _load_config() -> dict:
         "retain_context": _scoped_setting("HINDSIGHT_RETAIN_CONTEXT", _RETAIN_CONTEXT_DEFAULT),
         "retain_indicator": _scoped_flag("HINDSIGHT_RETAIN_INDICATOR", True),
         "recall_indicator": _scoped_flag("HINDSIGHT_RECALL_INDICATOR", True),
-        "recall_sync": _scoped_flag("HINDSIGHT_RECALL_SYNC", False),
+        "recall_sync": _scoped_flag("HINDSIGHT_RECALL_SYNC", True),
         "banks": {
             "hermes": {
                 "bankId": get_secret("HINDSIGHT_BANK_ID", "") or "hermes",
@@ -503,6 +512,20 @@ _SYSTEM_PROMPT_TAILS = {
     "tools": _TOOL_GUIDANCE,
     "hybrid": f"{_CONTEXT_NOTE} {_TOOL_GUIDANCE}",
 }
+
+
+@dataclass(frozen=True)
+class _RecallResult:
+    text: str = ""
+    count: int = 0
+    candidates: tuple[MemoryCandidate, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RecallTurn:
+    generation: int
+    session_id: str
+    deadline: float
 
 
 class HindsightMemoryProvider(MemoryProvider):
@@ -584,6 +607,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # only if no newer one started since, so a slow recall can't overwrite a fresher one or
         # land in the next session.
         self._prefetch_generation = 0
+        self._context_generation = 0
         self._last_recall_returned, self._last_recall_count = False, 0
         self._apply_recall_settings({})
 
@@ -811,7 +835,12 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {
                 "key": "recall_sync",
-                "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.",
+                "description": "Recall synchronously against the current request plus bounded recent dialogue before each turn. Default on; false selects legacy next-turn background prefetch.",
+                "default": True,
+            },
+            {
+                "key": "context_compiler",
+                "description": "Use auxiliary.memory_context to select retrieved evidence IDs. Invalid output falls back to ranked original evidence.",
                 "default": False,
             },
             {
@@ -854,8 +883,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {
                 "key": "recall_max_input_chars",
-                "description": "Maximum input query length for auto-recall",
-                "default": 800,
+                "description": "Maximum current-request plus recent-dialogue query length for auto-recall",
+                "default": 4000,
             },
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -1401,12 +1430,15 @@ class HindsightMemoryProvider(MemoryProvider):
         """Start a cooldown for *operation* on a failing extra bank, warning once per outage.
         Recall and writes cool down separately: a slow search must not stop writes."""
         key = (operation, bank_id)
+        # Recall exceptions can echo private query text; preserve outage diagnostics
+        # without logging the provider's response body.
+        detail = type(exc).__name__ if operation == "recall" else exc
         if key not in self._extra_bank_down_until:
             logger.warning(
-                "Hindsight %s: skipping bank %s for %.0fs: %r", operation, bank_id, _EXTRA_BANK_COOLDOWN, exc
+                "Hindsight %s: skipping bank %s for %.0fs: %r", operation, bank_id, _EXTRA_BANK_COOLDOWN, detail
             )
         else:
-            logger.debug("Hindsight %s: bank %s still failing: %r", operation, bank_id, exc)
+            logger.debug("Hindsight %s: bank %s still failing: %r", operation, bank_id, detail)
         self._extra_bank_down_until[key] = time.monotonic() + _EXTRA_BANK_COOLDOWN
 
     def _mark_bank_ok(self, operation: str, bank_id: str) -> None:
@@ -1552,9 +1584,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._reflect_tags = _normalize_string_list(cfg.get("reflect_tags")) or None
         self._reflect_tags_match = cfg.get("reflect_tags_match", "any")
         self._auto_recall = cfg.get("auto_recall", True)
-        self._recall_sync = bool(cfg.get("recall_sync", False))
+        self._recall_sync = bool(cfg.get("recall_sync", True))
+        self._context_compiler = bool(cfg.get("context_compiler", False))
         self._recall_max_tokens = _parse_int_setting(cfg.get("recall_max_tokens"), 4096)
-        self._recall_max_input_chars = _parse_int_setting(cfg.get("recall_max_input_chars"), 800)
+        self._recall_max_input_chars = _parse_int_setting(cfg.get("recall_max_input_chars"), 4000)
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
         # recall_max_tokens budget); a comma-separated string is accepted for parity
@@ -1669,7 +1702,7 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
-    def _recall(self, query: str) -> list:
+    def _recall(self, query: str, *, turn: _RecallTurn | None = None) -> list:
         """Semantic recall across the write set (primary bank first, then
         mirrors/additional banks), then any recall-only banks. A result whose text an
         earlier bank already returned is dropped.
@@ -1679,6 +1712,10 @@ class HindsightMemoryProvider(MemoryProvider):
         single-bank recall does; a failing extra bank is skipped with a warning.
         Single-bank configs query exactly ``_bank_id``.
         """
+        with self._prefetch_lock:
+            if turn is None:
+                turn = _RecallTurn(self._context_generation, self._session_id, float("inf"))
+            background_generation = self._prefetch_generation
         bank_ids = [
             bank_id
             for i, bank_id in enumerate(self._build_recall_bank_ids())
@@ -1714,15 +1751,22 @@ class HindsightMemoryProvider(MemoryProvider):
         results, seen = [], set()
         for bank_id, resp in zip(bank_ids, self._run_hindsight_operation(_recall_all)):
             is_extra = bank_id != bank_ids[0]
+            # A detached old call must not clear a newer outage or start a
+            # cooldown in the next session. The context/result fence alone
+            # cannot undo these shared health-cache mutations.
+            with self._prefetch_lock:
+                current = self._turn_is_current(turn) and background_generation == self._prefetch_generation
+                if current:
+                    if isinstance(resp, BaseException):
+                        # An unwritten bank's 404 means empty, not unavailable.
+                        if not _bank_not_written_yet(resp):
+                            self._log_bank_failure("recall", bank_id, resp)
+                        elif is_extra:
+                            self._mark_bank_ok("recall", bank_id)
+                    elif is_extra:
+                        self._mark_bank_ok("recall", bank_id)
             if isinstance(resp, BaseException):
-                # A bank nothing was retained to answers 404: it has nothing to find, it is not down.
-                if not _bank_not_written_yet(resp):
-                    self._log_bank_failure("recall", bank_id, resp)
-                elif is_extra:
-                    self._mark_bank_ok("recall", bank_id)
                 continue
-            if is_extra:
-                self._mark_bank_ok("recall", bank_id)
             bank_results = resp.results or []
             if self._recall_min_scores:
                 bank_results = [r for r in bank_results if _clears_min_scores(r, self._recall_min_scores)]
@@ -1745,24 +1789,30 @@ class HindsightMemoryProvider(MemoryProvider):
             raise
         return resp.text
 
-    def _do_recall(self, query: str) -> tuple[str, int]:
+    def _do_recall(self, query: str, *, turn: _RecallTurn | None = None) -> _RecallResult:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
-        -> (text, memory count); the count is 0 for reflect (synthesis) and on error."""
-        if self._recall_max_input_chars:
+        with original evidence; count is 0 for reflect (synthesis) and on error."""
+        if self._recall_max_input_chars > 0:
             query = query[: self._recall_max_input_chars]
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                return self._reflect(query) or "", 0
+                return _RecallResult(self._reflect(query) or "", 0)
             logger.debug(
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
-            results = self._recall(query)
-            logger.debug("Recall: returned %d results", len(results))
-            return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
-        except Exception as e:
-            logger.warning("Hindsight recall failed: %s", e, exc_info=True)
-            return "", 0
+            results = self._recall(query, turn=turn)
+            candidates = tuple(
+                candidate
+                for index, result in enumerate(results, start=1)
+                if (candidate := memory_candidate(result, index)) is not None
+            )
+            logger.debug("Recall: returned %d usable results", len(candidates))
+            return _RecallResult("\n".join(f"- {r.text}" for r in candidates), len(candidates), candidates)
+        except Exception as exc:
+            # Transport error bodies can echo the query or authorization headers.
+            logger.warning("Hindsight recall failed (%s)", type(exc).__name__)
+            return _RecallResult()
 
     def _finish_prefetch(self, result: str, count: int) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
@@ -1772,9 +1822,9 @@ class HindsightMemoryProvider(MemoryProvider):
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
-            "# Hindsight Memory (persistent cross-session context)\n"
-            "Use this to answer questions about the user and prior sessions. "
-            "Do not call tools to look up information that is already present here."
+            "# Hindsight Memory Evidence\n"
+            "Retrieved evidence may be stale, incomplete, or conflicting; "
+            "prefer current user input and canonical current sources."
         )
         return f"{header}\n\n{result}"
 
@@ -1785,47 +1835,130 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: waiting for background thread to complete")
         self._prefetch_thread.join(timeout=timeout)
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        # Opt-in: recall synchronously against the *current* message so the
-        # injected memories match this turn's query, not the previous turn's.
-        # See NousResearch/hermes-agent#5820.
+    @property
+    def prefetch_timeout_seconds(self) -> Optional[float]:
+        """Give the host the archived request plus compiler/retry headroom."""
+        if not self._recall_sync:
+            return None
+        return max(180.0, float(self._timeout) + 90.0)
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        # Host timeouts do not kill provider threads. Fence the local indicator
+        # even on turns that the host skips (empty requests, greetings, etc.).
+        with self._prefetch_lock:
+            self._context_generation += 1
+            self._last_recall_returned, self._last_recall_count = False, 0
+
+    def _turn_is_current(self, turn: _RecallTurn) -> bool:
+        """Caller holds _prefetch_lock; no I/O while that lock is held."""
+        return (
+            turn.generation == self._context_generation
+            and turn.session_id == self._session_id
+            and not self._shutting_down.is_set()
+            and time.monotonic() < turn.deadline
+        )
+
+    def prefetch(self, query: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None) -> str:
+        query = content_text(query)
+        with self._prefetch_lock:
+            if session_id and session_id != self._session_id:
+                return ""
+            self._context_generation += 1
+            turn = _RecallTurn(
+                self._context_generation,
+                self._session_id,
+                # Reserve host scheduling/teardown headroom. A call that finishes
+                # after our budget must not resurrect its indicator after the
+                # host has already stopped waiting for it.
+                time.monotonic() + ((self.prefetch_timeout_seconds - 30.0) if self._recall_sync else 8.0),
+            )
+            self._last_recall_returned, self._last_recall_count = False, 0
+            if not query or self._recall_disabled():
+                # No usable current intent: don't join or start retrieval and
+                # don't let an older queued result leak into a later turn.
+                self._prefetch_generation += 1
+                self._prefetch_result, self._prefetch_count = "", 0
+                return ""
+
         if self._recall_sync:
-            return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query)))
-        # Default: the background worker's result for the previous turn (capped join).
+            # Snapshot normalized text before I/O. The caller may reuse/mutate its
+            # transcript while a timed-out worker is still running.
+            dialogue = [message.model_dump() for message in recent_dialogue(messages)]
+            retrieval_query = build_recall_query(query, dialogue, max_chars=self._recall_max_input_chars)
+            recalled = self._do_recall(retrieval_query, turn=turn)
+            with self._prefetch_lock:
+                if not self._turn_is_current(turn):
+                    return ""
+            text, count = recalled.text, recalled.count
+            if recalled.candidates:
+                compiled = None
+                if self._context_compiler:
+                    try:
+                        compiled = compile_memory_context(
+                            current_query=query, recent_messages=dialogue, candidates=recalled.candidates
+                        )
+                    except Exception as exc:
+                        logger.debug("Hindsight context compiler failed open (%s)", type(exc).__name__)
+                arranged = compiled or render_ranked_memory_context(recalled.candidates)
+                if arranged is not None:
+                    text, count = arranged.text, arranged.count
+            with self._prefetch_lock:
+                if not self._turn_is_current(turn):
+                    return ""
+                return self._finish_prefetch(text, count)
+
+        # Explicit legacy mode consumes the queued next-turn result.
         self._join_prefetch(3.0, log=True)
         with self._prefetch_lock:
+            if not self._turn_is_current(turn):
+                return ""
             result, count = self._prefetch_result, self._prefetch_count
             self._prefetch_result, self._prefetch_count = "", 0
-        return self._finish_prefetch(result, count)
+            return self._finish_prefetch(result, count)
 
     def recall_status(self) -> Optional[RecallStatus]:
         """Count injected by the last prefetch; None if nothing injected or ``recall_indicator=false``."""
-        if not self._recall_indicator or not self._last_recall_returned:
-            return None
-        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
+        with self._prefetch_lock:
+            if not self._recall_indicator or not self._last_recall_returned:
+                return None
+            return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
         if self._recall_sync or self._recall_disabled():
             return
-        # A late call for a session we already left must not prime (or bump the generation of) this one (#5628).
-        if session_id and session_id != self._session_id:
-            return
-
+        query = content_text(query)
         with self._prefetch_lock:
+            # Check under the lock so a session switch cannot race the generation bump (#5628).
+            if session_id and session_id != self._session_id:
+                return
             self._prefetch_generation += 1
             generation = self._prefetch_generation
+            queued_session = self._session_id
+            self._prefetch_result, self._prefetch_count = "", 0
+            if not query:
+                return
 
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
             # retain to be recall-visible so the warmed context includes it.
             if self._prefetch_waits_for_retain:
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            text, count = self._do_recall(query)
-            if text:
-                with self._prefetch_lock:
-                    if generation == self._prefetch_generation:
-                        self._prefetch_result, self._prefetch_count = text, count
+            with self._prefetch_lock:
+                if (
+                    generation != self._prefetch_generation
+                    or queued_session != self._session_id
+                    or self._shutting_down.is_set()
+                ):
+                    return
+            recalled = self._do_recall(query)
+            with self._prefetch_lock:
+                if (
+                    generation == self._prefetch_generation
+                    and queued_session == self._session_id
+                    and not self._shutting_down.is_set()
+                ):
+                    self._prefetch_result, self._prefetch_count = recalled.text, recalled.count
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -2180,6 +2313,14 @@ class HindsightMemoryProvider(MemoryProvider):
         if not new_id:
             return
 
+        # Invalidate before any bounded joins or flushing: even a same-session
+        # rewind must fence a detached current-turn recall immediately.
+        with self._prefetch_lock:
+            self._context_generation += 1
+            self._prefetch_generation += 1
+            self._prefetch_result, self._prefetch_count = "", 0
+            self._last_recall_returned, self._last_recall_count = False, 0
+
         # 1. Flush buffered turns under the OLD identifiers, resolved BEFORE the
         # rotation (legacy: per-process unique; >=0.5.0: session-scoped + append).
         self._flush_buffered_turns("flush-on-switch")
@@ -2226,6 +2367,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._flush_buffered_turns("flush-on-shutdown")
         # Stop accepting retain jobs first so late sync_turn() calls are dropped.
         self._shutting_down.set()
+        with self._prefetch_lock:
+            self._context_generation += 1
+            self._prefetch_generation += 1
+            self._prefetch_result, self._prefetch_count = "", 0
+            self._last_recall_returned, self._last_recall_count = False, 0
         # The writer finishes in-flight work then exits on the sentinel; the
         # bounded join keeps shutdown predictable even if the daemon is wedged.
         if (writer := self._writer_thread) is not None and writer.is_alive():
