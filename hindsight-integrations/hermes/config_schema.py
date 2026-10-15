@@ -15,6 +15,22 @@ CONFIG_SCHEMA = ProviderConfigSchema(
     label="Hindsight",
     fields=(
         ProviderField(
+            key="recall_sync",
+            label="Current-turn recall",
+            kind=KIND_BOOL,
+            default=True,
+            inline=True,
+            description="Recall against the current request and bounded recent dialogue before answering. False enables legacy next-turn prefetch.",
+        ),
+        ProviderField(
+            key="context_compiler",
+            label="Compile memory evidence",
+            kind=KIND_BOOL,
+            default=False,
+            inline=True,
+            description="Select original evidence using auxiliary.memory_context. Routing is configured in Hermes; failures use ranked evidence.",
+        ),
+        ProviderField(
             key="mode",
             label="Mode",
             kind=KIND_SELECT,

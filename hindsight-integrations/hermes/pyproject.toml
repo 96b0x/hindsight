@@ -15,8 +15,10 @@ dependencies = [
     # task"). That breaks local_embedded outright. Anyone who installed between
     # 2026-09-14 and 2026-09-21 is pinned to the broken release until a floor moves them
     # off it, so keep these at >=0.10.1 rather than widening them back.
-    "hindsight-client>=0.10.1,<1",
-    "hindsight-embed>=0.10.1,<1",
+    # 1.0.0 is verified by tests/test_sdk_compatibility.py against the real
+    # client HTTP wire and embed manager surface; keep the 0.10.1 bugfix floor.
+    "hindsight-client>=0.10.1,<2",
+    "hindsight-embed>=0.10.1,<2",
 ]
 
 # The plugin is loaded from a directory by Hermes, not installed as a distribution.
@@ -24,7 +26,7 @@ dependencies = [
 package = false
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.13.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

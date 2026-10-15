@@ -212,7 +212,7 @@ def test_searching_a_bank_nothing_was_saved_to_finds_nothing(provider):
 def test_prefetch_injects_recalled_memories(provider):
     instance, fake = provider({"recall_sync": True}, client=FakeClient(recall_texts=["fact one"]))
     block = instance.prefetch("what do you know?")
-    assert "- fact one" in block
+    assert "[M0001] fact one" in block
     status = instance.recall_status()
     assert status.count == 1 and status.provider_label == "Hindsight"
     instance.shutdown()
@@ -639,7 +639,7 @@ def test_a_slow_prefetch_never_overwrites_a_newer_one(provider):
                 return FakeRecallResponse(["stale memory"])
             return FakeRecallResponse(["fresh memory"])
 
-    instance, _ = provider({"prefetch_waits_for_retain": False}, client=SlowFirst())
+    instance, _ = provider({"prefetch_waits_for_retain": False, "recall_sync": False}, client=SlowFirst())
     instance.queue_prefetch("old")
     old_worker = instance._prefetch_thread
     instance.queue_prefetch("new")
@@ -670,7 +670,7 @@ def test_a_mistyped_number_in_config_falls_back_to_its_default(provider):
     )
     assert instance._retain_every_n_turns == 1
     assert instance._recall_max_tokens == 4096
-    assert instance._recall_max_input_chars == 800
+    assert instance._recall_max_input_chars == 4000
     assert instance._prefetch_retain_drain_timeout == 10.0
 
 
