@@ -10,7 +10,9 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "hindsight-api-slim[all]==1.1.0",
+    # Keep the importer facade and embedded PostgreSQL, but leave local ML opt-in.
+    # The [all] extra pulled torch/transformers even with remote embedding providers.
+    "hindsight-api-slim[embedded-db]==1.1.0",
     "hindsight-client>=0.0.7",
     "hindsight-embed==1.1.0",
 ]

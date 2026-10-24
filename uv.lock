@@ -1536,7 +1536,7 @@ name = "hindsight-all"
 version = "1.1.0"
 source = { editable = "hindsight-all" }
 dependencies = [
-    { name = "hindsight-api-slim", extra = ["all"] },
+    { name = "hindsight-api-slim", extra = ["embedded-db"] },
     { name = "hindsight-client" },
     { name = "hindsight-embed" },
 ]
@@ -1552,7 +1552,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "hindsight-api-slim", extras = ["all"], editable = "hindsight-api-slim" },
+    { name = "hindsight-api-slim", extras = ["embedded-db"], editable = "hindsight-api-slim" },
     { name = "hindsight-api-slim", extras = ["local-llm"], marker = "extra == 'local-llm'", editable = "hindsight-api-slim" },
     { name = "hindsight-client", editable = "hindsight-clients/python" },
     { name = "hindsight-embed", editable = "hindsight-embed" },

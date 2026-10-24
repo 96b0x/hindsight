@@ -221,6 +221,50 @@ async def test_all_spam_preserves_input_order():
     assert await encoder._rank_group("query", ["first", "second", "third"]) == [1.0, 0.5, 0.0]
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_order"),
+    [
+        ({"ranked": ["UNKNOWN", "D00002", "D00002"], "spam_ids": ["D00001"]}, [2, 0, 3, 1]),
+        ({"ranked": ["UNKNOWN"], "spam_ids": []}, [0, 1, 2, 3]),
+        (TimeoutError("provider unavailable"), [0, 1, 2, 3]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recall_reranker_preserves_custom_selector_and_full_tail(payload, expected_order):
+    """Exercise the actual recall reranking seam, including upstream's pruning contract."""
+    from hindsight_api.engine.cross_encoder import RANK_SCORE_PROVIDERS
+    from hindsight_api.engine.search.reranking import CrossEncoderReranker
+    from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult
+
+    encoder = LLMMultiCriteriaCrossEncoder(api_key="test")
+    call = (
+        AsyncMock(side_effect=payload)
+        if isinstance(payload, Exception)
+        else AsyncMock(return_value=LLMCallResult(content=payload))
+    )
+    encoder._client = SimpleNamespace(call=call)
+    candidates = [
+        MergedCandidate(
+            retrieval=RetrievalResult(
+                id=f"fact-{index}",
+                text=f"Original evidence {index}",
+                fact_type="world",
+                occurred_start=None,
+                occurred_end=None,
+            ),
+            rrf_score=1.0 / (index + 1),
+        )
+        for index in range(4)
+    ]
+    result = await CrossEncoderReranker(cross_encoder=encoder).rerank("current request", candidates)
+    assert result.provider_name == "llm-multicriteria"
+    assert {"decision_model", "typesafe", "llm-multicriteria", "llm_multicriteria"} <= RANK_SCORE_PROVIDERS
+    assert [entry.candidate.retrieval.id for entry in result.results] == [f"fact-{i}" for i in expected_order]
+    # Rank zero is a retained tail item, not a relevance/pruning verdict.
+    assert len(result.results) == len(candidates)
+    call.assert_awaited_once()
+
+
 @pytest.mark.parametrize("route", ["configured", "credentials", "model", "refuse"])
 @pytest.mark.asyncio
 async def test_llm_request_extension_controls_reranker_wire_request(monkeypatch, route):
