@@ -47,7 +47,7 @@ def main():
     manifest = read_native_manifest(native_manifest_file(root))
     declaration = read_python_declaration(root)
     assert manifest["name"] == "hindsight"
-    assert declaration.is_member and declaration.pyproject == root / "pyproject.toml"
+    assert declaration.installs_packages and declaration.pyproject == root / "pyproject.toml"
     assert len(declaration.install_requirements) == 2
 
     spec = importlib.util.spec_from_file_location("real_hindsight_compiler", root / "compiler.py")

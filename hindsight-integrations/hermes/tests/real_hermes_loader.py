@@ -16,6 +16,12 @@ def main():
     (home / "plugins").mkdir(parents=True)
     (home / "plugins/hindsight").symlink_to(source, target_is_directory=True)
     (home / "config.yaml").write_text(json.dumps({"plugins": {"isolation": isolation}}))
+    (home / "hindsight").mkdir()
+    (home / "hindsight/config.json").write_text(
+        json.dumps(
+            {"mode": "local_external", "api_url": "http://127.0.0.1:1", "auto_recall": False, "auto_retain": False}
+        )
+    )
 
     from agent.memory_provider import MemoryProvider
     from hermes_cli.plugin_isolation import user_plugin_host
@@ -37,7 +43,9 @@ def main():
             assert host is None
             module = sys.modules[type(provider).__module__]
             assert Path(module.__file__).resolve() == (source / "__init__.py").resolve()
-        # No initialize(): this provider has no client and must perform no recall.
+        # Initializing applies the explicit no-recall/no-retain test config. An
+        # uninitialized provider has cloud defaults and may lazily make a request.
+        provider.initialize("real-loader-probe", platform="cli", agent_context="primary")
         # Exercise the real host signature/RPC and lifecycle without any service.
         provider.on_turn_start(1, "current question")
         assert provider.prefetch("current question", messages=[{"role": "assistant", "content": "prior answer"}]) == ""
